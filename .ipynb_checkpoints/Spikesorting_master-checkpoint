@@ -1,0 +1,523 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "ab35c3f4-5ac6-46e1-8163-ab3bc79cf67a",
+   "metadata": {},
+   "source": [
+    "# Load Data and check recording\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "id": "4a5d4bb0-6a24-4b99-a07d-d8ecb59f18c4",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "The autoreload extension is already loaded. To reload it, use:\n",
+      "  %reload_ext autoreload\n",
+      "SpikeGLXRecordingExtractor: 384 channels - 29999.900000 Hz - 1 segments - 73,547,469 samples \n",
+      "                            2,451.59s (40.86 minutes) - int16 dtype - 52.61 GiB\n"
+     ]
+    }
+   ],
+   "source": [
+    "import spikeinterface.full as si\n",
+    "import matplotlib.pyplot as plt\n",
+    "import numpy as np\n",
+    "import probeinterface as pi\n",
+    "from pathlib import Path\n",
+    "import pandas as pd \n",
+    "import os, sys\n",
+    "import shutil\n",
+    "from pprint import pprint \n",
+    "import time as time\n",
+    "%load_ext autoreload\n",
+    "%autoreload 2\n",
+    "\n",
+    "import bombcell as bc\n",
+    "\n",
+    "    \n",
+    "global_job_kwargs = dict(n_jobs=8, chunk_duration=\"10s\",progress_bar=True)\n",
+    "si.set_global_job_kwargs(**global_job_kwargs)\n",
+    "\n",
+    "\n",
+    "basefolder=r\"D:\\3556-17\\3556-17_recall_g0\"\n",
+    "metapath = basefolder + str('/Meta')\n",
+    "if not os.path.isdir(metapath):\n",
+    "   os.makedirs(metapath)\n",
+    "\n",
+    "\n",
+    "\n",
+    "recording =  si.read_spikeglx(basefolder, stream_id='imec0.ap', load_sync_channel=False)\n",
+    "lfp = si.read_spikeglx(basefolder, stream_id='imec0.lf', load_sync_channel=False)\n",
+    "event =  si.read_spikeglx(basefolder, stream_id='nidq', load_sync_channel=False)\n",
+    "\n",
+    "\n",
+    "\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "e60852e7-b850-420a-aa7f-0d680d0c5eba",
+   "metadata": {},
+   "source": [
+    "# Preprocessing"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "b5eb59a8-b0c1-4059-8b17-6ca0a1500921",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#recording = si.ChannelSliceRecording(recording, channel_ids=recording.get_channel_ids()[180:330])\n",
+    "rec1 = si.highpass_filter(recording, freq_min=400.)\n",
+    "rec1 = si.phase_shift(rec1)\n",
+    "bad_channel_ids, channel_labels = si.detect_bad_channels(rec1,method = 'coherence+psd')\n",
+    "print(bad_channel_ids)\n",
+    "rec1 = si.interpolate_bad_channels(recording=rec1, bad_channel_ids=bad_channel_ids)\n",
+    "\n",
+    "rec1 = si.common_reference(rec1, operator=\"median\", reference=\"global\")\n",
+    "print(rec1)\n",
+    "\n",
+    "\n",
+    "%matplotlib widget\n",
+    "si.plot_traces({'raw':recording,'filtered':rec1}, backend='ipywidgets')\n",
+    "\n",
+    "from spikeinterface.sorters import installed_sorters\n",
+    "installed_sorters()\n",
+    "import torch\n",
+    "print(torch.cuda.is_available())\n",
+    "print(torch.cuda.current_device())\n",
+    "torch.cuda.get_device_name(0)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "c34675ab-7faf-4cb1-96c1-019e6a372c41",
+   "metadata": {},
+   "source": [
+    "# Run Kilosort and postprocessing pipeline"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "c34b014d-d25f-4d88-83fb-65ddcb9d79f4",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "Sorting_KS4 = si.run_sorter(sorter_name=\"kilosort4\", recording=rec1, folder=basefolder + str('/sorted'),remove_existing_folder=True)\n",
+    "analyzer = si.create_sorting_analyzer(Sorting_KS4, rec1, sparse=True, format=\"memory\")\n",
+    "\n",
+    "analyzer.compute(['random_spikes', 'waveforms', 'templates', 'noise_levels','unit_locations','correlograms'],**global_job_kwargs)\n",
+    "analyzer.compute('spike_amplitudes')\n",
+    "analyzer.compute('principal_components', n_components = 5, mode=\"by_channel_local\",**global_job_kwargs)\n",
+    "\n",
+    "metric_names=['firing_rate', 'presence_ratio', 'snr','isi_violation', 'amplitude_cutoff']\n",
+    "metrics = si.compute_quality_metrics(analyzer, metric_names=metric_names)\n",
+    "\n",
+    "\n",
+    "amplitude_cutoff_thresh = 0.1\n",
+    "isi_violations_ratio_thresh = 0.5\n",
+    "presence_ratio_thresh = 0.9\n",
+    "\n",
+    "\n",
+    "our_query = f\"(amplitude_cutoff < {amplitude_cutoff_thresh}) & (isi_violations_ratio < {isi_violations_ratio_thresh}) & (presence_ratio > {presence_ratio_thresh})\"\n",
+    "\n",
+    "keep_units = metrics.query(our_query)\n",
+    "keep_unit_ids = keep_units.index.values\n",
+    "analyzer_clean = analyzer.select_units(keep_unit_ids, folder=basefolder +str('/analyzer_clean'), format='binary_folder')\n",
+    "print(analyzer)\n",
+    "print(analyzer_clean)\n",
+    "\n",
+    "si.export_to_phy(analyzer_clean, output_folder=basefolder + str('/sorted/phy'),**global_job_kwargs)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "a0e29244-5c3f-4ad5-8b41-e8241a40b8a3",
+   "metadata": {},
+   "source": [
+    "# examine Phy to create info.tsv"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "id": "0548315d-1bef-4111-8778-bcb250332bc9",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "\u001b[33m14:39:29.607 [W] model:667            Skipping spike waveforms that do not exist, they will be extracted on the fly from the raw data as needed.\u001b[0m\n"
+     ]
+    }
+   ],
+   "source": [
+    "param_path = f\"{basefolder}\\\\sorted\\\\phy\\\\params.py\"\n",
+    "!phy template-gui \"{param_path}\""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "fec42641-1b11-417c-bf16-053fb16fc73b",
+   "metadata": {},
+   "source": [
+    "# Bombcell "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "ea451426-df0c-4299-bd02-1a28dcca472d",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "ks_dir = basefolder + str('/sorted/sorter_output')\n",
+    "last_part = basefolder.split('/')[-1]\n",
+    "meta_path = f\"{basefolder}/{last_part}_imec0/{last_part}_t0.imec0.ap.meta\"\n",
+    "\n",
+    "# Set bombcell's output directory\n",
+    "save_path = Path(ks_dir) / \"bombcell\"\n",
+    "raw_file_path =  f\"{basefolder}/{last_part}_imec0/{last_part}_t0.imec0.ap.bin\"\n",
+    "meta_file_path =  f\"{basefolder}/{last_part}_imec0/{last_part}_t0.imec0.ap.meta\"\n",
+    "param = bc.get_default_parameters(ks_dir, \n",
+    "                                  raw_file=raw_file_path,\n",
+    "                                  meta_file=meta_file_path,\n",
+    "                                  kilosort_version=4)\n",
+    "(\n",
+    "    quality_metrics,\n",
+    "    param,\n",
+    "    unit_type,\n",
+    "    unit_type_string,\n",
+    ") = bc.run_bombcell(\n",
+    "    ks_dir, save_path, param\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "4c0db079-ebdc-405c-90f2-2427f967d1f0",
+   "metadata": {},
+   "source": [
+    "# Match Bombcell to SI and Phy"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "effe798b-ae16-4768-a9de-b997d6dfd2d8",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "basefolder=r\"D:\\3556-17\\3556-17_recall_g0\"\n",
+    "\n",
+    "import pandas as pd\n",
+    "\n",
+    "# Mapping from PHY cluster_id (SpikeInterface) to original Kilosort cluster_id\n",
+    "map_df = pd.read_csv(basefolder +str('/sorted/phy/cluster_si_unit_ids.tsv'), sep=\"\\t\")\n",
+    "bc_df = pd.read_csv(basefolder +str('/sorted/sorter_output/bombcell/cluster_bc_unitType.tsv'), sep=\"\\t\")\n",
+    "info_df = pd.read_csv(basefolder + str('/sorted/phy/cluster_info.tsv'), sep=\"\\t\")\n",
+    "\n",
+    "# Merge by matching Kilosort IDs\n",
+    "merged = map_df.merge(bc_df, left_on=\"si_unit_id\", right_on=\"cluster_id\", how=\"left\")\n",
+    "\n",
+    "# Now `merged['cluster_id_x']` is the SpikeInterface (PHY) cluster_id\n",
+    "# and `merged['bc_unitType']` is the Bombcell label\n",
+    "phy_labels = merged[[\"cluster_id_x\", \"bc_unitType\"]].rename(columns={\"cluster_id_x\": \"cluster_id\"})\n",
+    "\n",
+    "\n",
+    "\n",
+    "\n",
+    "# Merge new labels into PHY cluster info\n",
+    "info_df = info_df.merge(phy_labels, on=\"cluster_id\", how=\"left\")\n",
+    "\n",
+    "# Optional: overwrite or add a new column\n",
+    "info_df[\"group\"] = info_df[\"bc_unitType\"]  # or use a new column\n",
+    "\n",
+    "# Save back to PHY\n",
+    "phy_labels.to_csv(basefolder +str('/sorted/phy/cluster_bc_unitType.tsv'), sep=\"\\t\", index=False)\n",
+    "info_df.to_csv( basefolder +str('D:/3556-17/3556-17_recall_g0/sorted/phy/cluster_info.tsv'), sep=\"\\t\", index=False)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "5f9c74d9-f398-4ceb-8793-ae8ca968ed68",
+   "metadata": {},
+   "source": [
+    "# find ITI"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "4142e1c7-70ed-471f-86d0-32e70cdde80c",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "# --- Setup ---\n",
+    "channel_idx = 1  # Adjust as needed\n",
+    "channel_id = event.get_channel_ids()[channel_idx]\n",
+    "sf = event.get_sampling_frequency()\n",
+    "\n",
+    "# --- Load entire trace ---\n",
+    "trace = event.get_traces(channel_ids=[channel_id])\n",
+    "signal = trace[:, 0]\n",
+    "time_vector = np.arange(len(signal)) / sf\n",
+    "\n",
+    "# --- TTL edge detection ---\n",
+    "def extract_ttl_edges(signal, time_vector, threshold=1000):\n",
+    "    above_threshold = signal > threshold\n",
+    "    changes = np.diff(above_threshold.astype(int))\n",
+    "    \n",
+    "    rising_indices = np.where(changes == 1)[0] + 1\n",
+    "    falling_indices = np.where(changes == -1)[0] + 1\n",
+    "\n",
+    "    edge_indices = np.concatenate((rising_indices, falling_indices))\n",
+    "    edge_types = np.array(['rising'] * len(rising_indices) + ['falling'] * len(falling_indices))\n",
+    "\n",
+    "    sort_order = np.argsort(edge_indices)\n",
+    "    edge_indices = edge_indices[sort_order]\n",
+    "    edge_types = edge_types[sort_order]\n",
+    "\n",
+    "    edge_times = time_vector[edge_indices]\n",
+    "\n",
+    "    return edge_times, edge_types, edge_indices\n",
+    "\n",
+    "edge_times, edge_types, edge_indices = extract_ttl_edges(signal, time_vector, threshold=100)\n",
+    "\n",
+    "# --- Plot with markers ---\n",
+    "plt.figure(figsize=(12, 4))\n",
+    "plt.plot(time_vector, signal, label='Analog signal')\n",
+    "plt.plot(edge_times, signal[edge_indices], 'ro', label='TTL edges')\n",
+    "plt.title(f\"TTL signal with edges - channel {channel_id}\")\n",
+    "plt.xlabel(\"Time (s)\")\n",
+    "plt.ylabel(\"Amplitude\")\n",
+    "plt.legend()\n",
+    "plt.ylim(0, max(signal) * 1.1)\n",
+    "plt.show()\n",
+    "\n",
+    "# --- Save to CSV ---\n",
+    "df_edges = pd.DataFrame({\n",
+    "    'time_seconds': edge_times,\n",
+    "    'edge_type': edge_types\n",
+    "})\n",
+    "df_edges.to_csv(basefolder +str('/Meta/ttl_edge_times.csv'), index=False)\n",
+    "print(\"TTL edge times saved to 'ttl_edge_times.csv'\")\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "3ca18122-9f43-43ab-86b7-abf77c4831d8",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "id": "112f6535-1db9-460d-99c5-fa84141f0bca",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[0 0 0 ... 0 0 0]\n"
+     ]
+    },
+    {
+     "data": {
+      "image/png": "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0iR58MEHzQydOrD/G2+8ISNGjJClS5cW+3F0MoL27dvLvHnzvNs0EabrnTt3LvQ+R44cMcm6vDQRp/iFAwAAAAAAANYk0Xbu3GlagSmdoVNbo6krr7zSdK0sCW3Fpgm5t956S3766Se56667JCsryztb58CBA30mHujbt6+8/vrrMn36dNm8ebN8/vnnpnWabvck0wAAAAAAAICgTyxQr1492bFjh9SvX1/OPvts+eyzz6Rdu3ayfPly03WyJLRL6J49e0wrNk3OtWnTRubMmeOdbCA9Pd2n5dkTTzwhERER5v9t27ZJjRo1TALtb3/7W0lfBgAAAePYOChNPrTgLh2UIgAAQPgocRJNxyHTLpedOnWSe++9V2655RZ58803TcJr2LBhJQ5g6NChZilqIgGfYKOjJS0tzSyA27/AFobvtKfHDcVGwqL0UJThw63v5bahFMPrnHRDjIVxQ9Q2fv5YGJIrY3RL3Daeg26N28aYEKJJtGeffdanJVmDBg3km2++kaZNm5pWYQAAAACAskdeAAAsS6ItWrRIunTpYlqFqQsuuMAsJ0+eNLd169YtEHECYSEiItgRuBPFFl6oJwCAYODzJ7xwuEO77tgYE0J0YoEePXrI/v37C2zXCQb0NgAAAAAAAEDCPYmm4/ro4P757du3TypWrFhacQEA4FpuGGfDBSG6ghuONQAAAMq4O+e1115r/tcE2m233eYzE2dOTo6sXbvWdPMEbODWLzVujTvY3FBsbojRLagn4YNjXToox/AqSzfE6Na4bYzRxpjcGGNhbAzbtROHWBi2jTEhxJJoCQkJ3pZolStXlvLly3tvi4mJMeOiDRkyJDBRAgAAAABOidnAAcCSJNqUKVPM/w0bNpSHHnqIrptAADDA5emh2MIL9QQAEAx8/oQXDndo1x0bY0KIzs6Zlpbms/7ll19KVlaWdO7cWapWrVqasQEAAAAAAADuSqI999xzcvjwYRk1apS3qXDv3r3ls88+M+s1a9aUefPmScuWLQMXLQAALuCGzjT0+Anv8WkAAAAQwNk5Z8yYIa1atfKuz5w5UxYtWiRfffWV7N27Vzp06CAjR448jRCA0ufWrzR8qT09big2jm3poSzDB4e6lFCQYVWUbojRrYHb+PljYUgh82ODjVHbeA66NW4bY0KIJdE2b94srVu39q7Pnj1brr/+euna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",
+      "text/plain": [
+       "<Figure size 1500x300 with 1 Axes>"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "ename": "OSError",
+     "evalue": "Cannot save file into a non-existent directory: 'D:\\3556-17\\3556-17_recall_g0\\Metta'",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[1;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[1;31mOSError\u001b[0m                                   Traceback (most recent call last)",
+      "Cell \u001b[1;32mIn[13], line 53\u001b[0m\n\u001b[0;32m     48\u001b[0m     \u001b[38;5;28;01mreturn\u001b[39;00m np\u001b[38;5;241m.\u001b[39marray(first_in_trains)\n\u001b[0;32m     52\u001b[0m bits_to_extract \u001b[38;5;241m=\u001b[39m [\u001b[38;5;241m1\u001b[39m]  \n\u001b[1;32m---> 53\u001b[0m \u001b[43mextract_and_save_ttl_events\u001b[49m\u001b[43m(\u001b[49m\u001b[43mevent\u001b[49m\u001b[43m \u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43mbits_to_extract\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43mbasefolder\u001b[49m\u001b[43m \u001b[49m\u001b[38;5;241;43m+\u001b[39;49m\u001b[38;5;28;43mstr\u001b[39;49m\u001b[43m(\u001b[49m\u001b[38;5;124;43m'\u001b[39;49m\u001b[38;5;124;43m/Metta/\u001b[39;49m\u001b[38;5;124;43m'\u001b[39;49m\u001b[43m)\u001b[49m\u001b[43m)\u001b[49m\n",
+      "Cell \u001b[1;32mIn[13], line 14\u001b[0m, in \u001b[0;36mextract_and_save_ttl_events\u001b[1;34m(data, bits, save_path)\u001b[0m\n\u001b[0;32m     10\u001b[0m ttl_df \u001b[38;5;241m=\u001b[39m pd\u001b[38;5;241m.\u001b[39mDataFrame(ttl_timestamps, columns\u001b[38;5;241m=\u001b[39m[\u001b[38;5;124m'\u001b[39m\u001b[38;5;124mtimestamps\u001b[39m\u001b[38;5;124m'\u001b[39m])\n\u001b[0;32m     12\u001b[0m filename \u001b[38;5;241m=\u001b[39m \u001b[38;5;124mf\u001b[39m\u001b[38;5;124m'\u001b[39m\u001b[38;5;124msoundttl.csv\u001b[39m\u001b[38;5;124m'\u001b[39m\n\u001b[1;32m---> 14\u001b[0m \u001b[43mttl_df\u001b[49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43mto_csv\u001b[49m\u001b[43m(\u001b[49m\u001b[38;5;124;43mf\u001b[39;49m\u001b[38;5;124;43m\"\u001b[39;49m\u001b[38;5;132;43;01m{\u001b[39;49;00m\u001b[43msave_path\u001b[49m\u001b[38;5;132;43;01m}\u001b[39;49;00m\u001b[38;5;124;43m/\u001b[39;49m\u001b[38;5;132;43;01m{\u001b[39;49;00m\u001b[43mfilename\u001b[49m\u001b[38;5;132;43;01m}\u001b[39;49;00m\u001b[38;5;124;43m\"\u001b[39;49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43mindex\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[38;5;28;43;01mFalse\u001b[39;49;00m\u001b[43m)\u001b[49m\n\u001b[0;32m     15\u001b[0m \u001b[38;5;28mprint\u001b[39m(\u001b[38;5;124mf\u001b[39m\u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mExtracted TTL event timestamps for bit \u001b[39m\u001b[38;5;132;01m{\u001b[39;00mbit\u001b[38;5;132;01m}\u001b[39;00m\u001b[38;5;124m saved to \u001b[39m\u001b[38;5;132;01m{\u001b[39;00mfilename\u001b[38;5;132;01m}\u001b[39;00m\u001b[38;5;124m\"\u001b[39m)\n",
+      "File \u001b[1;32m~\\AppData\\Local\\anaconda3\\envs\\si_env\\lib\\site-packages\\pandas\\util\\_decorators.py:333\u001b[0m, in \u001b[0;36mdeprecate_nonkeyword_arguments.<locals>.decorate.<locals>.wrapper\u001b[1;34m(*args, **kwargs)\u001b[0m\n\u001b[0;32m    327\u001b[0m \u001b[38;5;28;01mif\u001b[39;00m \u001b[38;5;28mlen\u001b[39m(args) \u001b[38;5;241m>\u001b[39m num_allow_args:\n\u001b[0;32m    328\u001b[0m     warnings\u001b[38;5;241m.\u001b[39mwarn(\n\u001b[0;32m    329\u001b[0m         msg\u001b[38;5;241m.\u001b[39mformat(arguments\u001b[38;5;241m=\u001b[39m_format_argument_list(allow_args)),\n\u001b[0;32m    330\u001b[0m         \u001b[38;5;167;01mFutureWarning\u001b[39;00m,\n\u001b[0;32m    331\u001b[0m         stacklevel\u001b[38;5;241m=\u001b[39mfind_stack_level(),\n\u001b[0;32m    332\u001b[0m     )\n\u001b[1;32m--> 333\u001b[0m \u001b[38;5;28;01mreturn\u001b[39;00m func(\u001b[38;5;241m*\u001b[39margs, \u001b[38;5;241m*\u001b[39m\u001b[38;5;241m*\u001b[39mkwargs)\n",
+      "File \u001b[1;32m~\\AppData\\Local\\anaconda3\\envs\\si_env\\lib\\site-packages\\pandas\\core\\generic.py:3967\u001b[0m, in \u001b[0;36mNDFrame.to_csv\u001b[1;34m(self, path_or_buf, sep, na_rep, float_format, columns, header, index, index_label, mode, encoding, compression, quoting, quotechar, lineterminator, chunksize, date_format, doublequote, escapechar, decimal, errors, storage_options)\u001b[0m\n\u001b[0;32m   3956\u001b[0m df \u001b[38;5;241m=\u001b[39m \u001b[38;5;28mself\u001b[39m \u001b[38;5;28;01mif\u001b[39;00m \u001b[38;5;28misinstance\u001b[39m(\u001b[38;5;28mself\u001b[39m, ABCDataFrame) \u001b[38;5;28;01melse\u001b[39;00m \u001b[38;5;28mself\u001b[39m\u001b[38;5;241m.\u001b[39mto_frame()\n\u001b[0;32m   3958\u001b[0m formatter \u001b[38;5;241m=\u001b[39m DataFrameFormatter(\n\u001b[0;32m   3959\u001b[0m     frame\u001b[38;5;241m=\u001b[39mdf,\n\u001b[0;32m   3960\u001b[0m     header\u001b[38;5;241m=\u001b[39mheader,\n\u001b[1;32m   (...)\u001b[0m\n\u001b[0;32m   3964\u001b[0m     decimal\u001b[38;5;241m=\u001b[39mdecimal,\n\u001b[0;32m   3965\u001b[0m )\n\u001b[1;32m-> 3967\u001b[0m \u001b[38;5;28;01mreturn\u001b[39;00m \u001b[43mDataFrameRenderer\u001b[49m\u001b[43m(\u001b[49m\u001b[43mformatter\u001b[49m\u001b[43m)\u001b[49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43mto_csv\u001b[49m\u001b[43m(\u001b[49m\n\u001b[0;32m   3968\u001b[0m \u001b[43m    \u001b[49m\u001b[43mpath_or_buf\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3969\u001b[0m \u001b[43m    \u001b[49m\u001b[43mlineterminator\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mlineterminator\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3970\u001b[0m \u001b[43m    \u001b[49m\u001b[43msep\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43msep\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3971\u001b[0m \u001b[43m    \u001b[49m\u001b[43mencoding\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mencoding\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3972\u001b[0m \u001b[43m    \u001b[49m\u001b[43merrors\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43merrors\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3973\u001b[0m \u001b[43m    \u001b[49m\u001b[43mcompression\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mcompression\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3974\u001b[0m \u001b[43m    \u001b[49m\u001b[43mquoting\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mquoting\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3975\u001b[0m \u001b[43m    \u001b[49m\u001b[43mcolumns\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mcolumns\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3976\u001b[0m \u001b[43m    \u001b[49m\u001b[43mindex_label\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mindex_label\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3977\u001b[0m \u001b[43m    \u001b[49m\u001b[43mmode\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mmode\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3978\u001b[0m \u001b[43m    \u001b[49m\u001b[43mchunksize\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mchunksize\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3979\u001b[0m \u001b[43m    \u001b[49m\u001b[43mquotechar\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mquotechar\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3980\u001b[0m \u001b[43m    \u001b[49m\u001b[43mdate_format\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mdate_format\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3981\u001b[0m \u001b[43m    \u001b[49m\u001b[43mdoublequote\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mdoublequote\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3982\u001b[0m \u001b[43m    \u001b[49m\u001b[43mescapechar\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mescapechar\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3983\u001b[0m \u001b[43m    \u001b[49m\u001b[43mstorage_options\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[43mstorage_options\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m   3984\u001b[0m \u001b[43m\u001b[49m\u001b[43m)\u001b[49m\n",
+      "File \u001b[1;32m~\\AppData\\Local\\anaconda3\\envs\\si_env\\lib\\site-packages\\pandas\\io\\formats\\format.py:1014\u001b[0m, in \u001b[0;36mDataFrameRenderer.to_csv\u001b[1;34m(self, path_or_buf, encoding, sep, columns, index_label, mode, compression, quoting, quotechar, lineterminator, chunksize, date_format, doublequote, escapechar, errors, storage_options)\u001b[0m\n\u001b[0;32m    993\u001b[0m     created_buffer \u001b[38;5;241m=\u001b[39m \u001b[38;5;28;01mFalse\u001b[39;00m\n\u001b[0;32m    995\u001b[0m csv_formatter \u001b[38;5;241m=\u001b[39m CSVFormatter(\n\u001b[0;32m    996\u001b[0m     path_or_buf\u001b[38;5;241m=\u001b[39mpath_or_buf,\n\u001b[0;32m    997\u001b[0m     lineterminator\u001b[38;5;241m=\u001b[39mlineterminator,\n\u001b[1;32m   (...)\u001b[0m\n\u001b[0;32m   1012\u001b[0m     formatter\u001b[38;5;241m=\u001b[39m\u001b[38;5;28mself\u001b[39m\u001b[38;5;241m.\u001b[39mfmt,\n\u001b[0;32m   1013\u001b[0m )\n\u001b[1;32m-> 1014\u001b[0m \u001b[43mcsv_formatter\u001b[49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43msave\u001b[49m\u001b[43m(\u001b[49m\u001b[43m)\u001b[49m\n\u001b[0;32m   1016\u001b[0m \u001b[38;5;28;01mif\u001b[39;00m created_buffer:\n\u001b[0;32m   1017\u001b[0m     \u001b[38;5;28;01massert\u001b[39;00m \u001b[38;5;28misinstance\u001b[39m(path_or_buf, StringIO)\n",
+      "File \u001b[1;32m~\\AppData\\Local\\anaconda3\\envs\\si_env\\lib\\site-packages\\pandas\\io\\formats\\csvs.py:251\u001b[0m, in \u001b[0;36mCSVFormatter.save\u001b[1;34m(self)\u001b[0m\n\u001b[0;32m    247\u001b[0m \u001b[38;5;250m\u001b[39m\u001b[38;5;124;03m\"\"\"\u001b[39;00m\n\u001b[0;32m    248\u001b[0m \u001b[38;5;124;03mCreate the writer & save.\u001b[39;00m\n\u001b[0;32m    249\u001b[0m \u001b[38;5;124;03m\"\"\"\u001b[39;00m\n\u001b[0;32m    250\u001b[0m \u001b[38;5;66;03m# apply compression and byte/text conversion\u001b[39;00m\n\u001b[1;32m--> 251\u001b[0m \u001b[38;5;28;01mwith\u001b[39;00m \u001b[43mget_handle\u001b[49m\u001b[43m(\u001b[49m\n\u001b[0;32m    252\u001b[0m \u001b[43m    \u001b[49m\u001b[38;5;28;43mself\u001b[39;49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43mfilepath_or_buffer\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m    253\u001b[0m \u001b[43m    \u001b[49m\u001b[38;5;28;43mself\u001b[39;49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43mmode\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m    254\u001b[0m \u001b[43m    \u001b[49m\u001b[43mencoding\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[38;5;28;43mself\u001b[39;49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43mencoding\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m    255\u001b[0m \u001b[43m    \u001b[49m\u001b[43merrors\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[38;5;28;43mself\u001b[39;49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43merrors\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m    256\u001b[0m \u001b[43m    \u001b[49m\u001b[43mcompression\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[38;5;28;43mself\u001b[39;49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43mcompression\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m    257\u001b[0m \u001b[43m    \u001b[49m\u001b[43mstorage_options\u001b[49m\u001b[38;5;241;43m=\u001b[39;49m\u001b[38;5;28;43mself\u001b[39;49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43mstorage_options\u001b[49m\u001b[43m,\u001b[49m\n\u001b[0;32m    258\u001b[0m \u001b[43m\u001b[49m\u001b[43m)\u001b[49m \u001b[38;5;28;01mas\u001b[39;00m handles:\n\u001b[0;32m    259\u001b[0m     \u001b[38;5;66;03m# Note: self.encoding is irrelevant here\u001b[39;00m\n\u001b[0;32m    260\u001b[0m     \u001b[38;5;28mself\u001b[39m\u001b[38;5;241m.\u001b[39mwriter \u001b[38;5;241m=\u001b[39m csvlib\u001b[38;5;241m.\u001b[39mwriter(\n\u001b[0;32m    261\u001b[0m         handles\u001b[38;5;241m.\u001b[39mhandle,\n\u001b[0;32m    262\u001b[0m         lineterminator\u001b[38;5;241m=\u001b[39m\u001b[38;5;28mself\u001b[39m\u001b[38;5;241m.\u001b[39mlineterminator,\n\u001b[1;32m   (...)\u001b[0m\n\u001b[0;32m    267\u001b[0m         quotechar\u001b[38;5;241m=\u001b[39m\u001b[38;5;28mself\u001b[39m\u001b[38;5;241m.\u001b[39mquotechar,\n\u001b[0;32m    268\u001b[0m     )\n\u001b[0;32m    270\u001b[0m     \u001b[38;5;28mself\u001b[39m\u001b[38;5;241m.\u001b[39m_save()\n",
+      "File \u001b[1;32m~\\AppData\\Local\\anaconda3\\envs\\si_env\\lib\\site-packages\\pandas\\io\\common.py:749\u001b[0m, in \u001b[0;36mget_handle\u001b[1;34m(path_or_buf, mode, encoding, compression, memory_map, is_text, errors, storage_options)\u001b[0m\n\u001b[0;32m    747\u001b[0m \u001b[38;5;66;03m# Only for write methods\u001b[39;00m\n\u001b[0;32m    748\u001b[0m \u001b[38;5;28;01mif\u001b[39;00m \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mr\u001b[39m\u001b[38;5;124m\"\u001b[39m \u001b[38;5;129;01mnot\u001b[39;00m \u001b[38;5;129;01min\u001b[39;00m mode \u001b[38;5;129;01mand\u001b[39;00m is_path:\n\u001b[1;32m--> 749\u001b[0m     \u001b[43mcheck_parent_directory\u001b[49m\u001b[43m(\u001b[49m\u001b[38;5;28;43mstr\u001b[39;49m\u001b[43m(\u001b[49m\u001b[43mhandle\u001b[49m\u001b[43m)\u001b[49m\u001b[43m)\u001b[49m\n\u001b[0;32m    751\u001b[0m \u001b[38;5;28;01mif\u001b[39;00m compression:\n\u001b[0;32m    752\u001b[0m     \u001b[38;5;28;01mif\u001b[39;00m compression \u001b[38;5;241m!=\u001b[39m \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mzstd\u001b[39m\u001b[38;5;124m\"\u001b[39m:\n\u001b[0;32m    753\u001b[0m         \u001b[38;5;66;03m# compression libraries do not like an explicit text-mode\u001b[39;00m\n",
+      "File \u001b[1;32m~\\AppData\\Local\\anaconda3\\envs\\si_env\\lib\\site-packages\\pandas\\io\\common.py:616\u001b[0m, in \u001b[0;36mcheck_parent_directory\u001b[1;34m(path)\u001b[0m\n\u001b[0;32m    614\u001b[0m parent \u001b[38;5;241m=\u001b[39m Path(path)\u001b[38;5;241m.\u001b[39mparent\n\u001b[0;32m    615\u001b[0m \u001b[38;5;28;01mif\u001b[39;00m \u001b[38;5;129;01mnot\u001b[39;00m parent\u001b[38;5;241m.\u001b[39mis_dir():\n\u001b[1;32m--> 616\u001b[0m     \u001b[38;5;28;01mraise\u001b[39;00m \u001b[38;5;167;01mOSError\u001b[39;00m(\u001b[38;5;124mrf\u001b[39m\u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mCannot save file into a non-existent directory: \u001b[39m\u001b[38;5;124m'\u001b[39m\u001b[38;5;132;01m{\u001b[39;00mparent\u001b[38;5;132;01m}\u001b[39;00m\u001b[38;5;124m'\u001b[39m\u001b[38;5;124m\"\u001b[39m)\n",
+      "\u001b[1;31mOSError\u001b[0m: Cannot save file into a non-existent directory: 'D:\\3556-17\\3556-17_recall_g0\\Metta'"
+     ]
+    }
+   ],
+   "source": [
+    "\n",
+    "\n",
+    "\n",
+    "\n",
+    "def extract_and_save_ttl_events(data, bits, save_path):\n",
+    "    digital_signals = data.get_traces()\n",
+    "    digital_word = digital_signals[:, 8]\n",
+    "    print(digital_word)\n",
+    "    sampling_rate = data.get_sampling_frequency()\n",
+    "    for bit in bits:\n",
+    "        # Extract TTL pulses for the current bit\n",
+    "        ttl_timestamps = extract_ttl_from_bit(digital_word, bit, sampling_rate)\n",
+    "        \n",
+    "        ttl_df = pd.DataFrame(ttl_timestamps, columns=['timestamps'])\n",
+    "        \n",
+    "        filename = f'soundttl.csv'\n",
+    "        \n",
+    "        ttl_df.to_csv(f\"{save_path}/{filename}\", index=False)\n",
+    "        print(f\"Extracted TTL event timestamps for bit {bit} saved to {filename}\")\n",
+    "\n",
+    "\n",
+    "def extract_ttl_from_bit(digital_word, bit, sampling_rate, min_gap_s=5.0):\n",
+    "    \"\"\"\n",
+    "    Extract and plot TTL bursts, return first rising edge per train.\n",
+    "    \"\"\"\n",
+    "    ttl_signal = (digital_word >> bit) & 1  # isolate bit\n",
+    "    time_axis = np.arange(len(ttl_signal)) / sampling_rate\n",
+    "\n",
+    "    # Plot full or cropped TTL signal\n",
+    "    plt.figure(figsize=(15, 3))\n",
+    "    plt.plot(time_axis, ttl_signal)\n",
+    "    plt.title(f'Isolated Bit {bit} State (0 or 1)')\n",
+    "    plt.xlabel('Time (seconds)')\n",
+    "    plt.ylabel('Bit State')\n",
+    "    plt.ylim(-0.1, 1.5)\n",
+    "    #plt.xlim(0, min(time_axis[-1], 10))  # plot first 10 seconds by default\n",
+    "    plt.show()\n",
+    "\n",
+    "    # Rising edges (0 → 1)\n",
+    "    rising_indices = np.where(np.diff(ttl_signal) > 0)[0]\n",
+    "    rising_timestamps = rising_indices / sampling_rate\n",
+    "\n",
+    "    # Detect first rising edge of each train\n",
+    "    if len(rising_timestamps) == 0:\n",
+    "        return np.array([])\n",
+    "\n",
+    "    first_in_trains = [rising_timestamps[0]]\n",
+    "    for i in range(1, len(rising_timestamps)):\n",
+    "        if rising_timestamps[i] - rising_timestamps[i - 1] > min_gap_s:\n",
+    "            first_in_trains.append(rising_timestamps[i])\n",
+    "\n",
+    "    return np.array(first_in_trains)\n",
+    "\n",
+    "\n",
+    "\n",
+    "bits_to_extract = [1]  \n",
+    "extract_and_save_ttl_events(event , bits_to_extract, basefolder +str('/Meta/'))\n",
+    "\n",
+    "\n",
+    "\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "56406066-0e1e-4521-a899-7ecea919490d",
+   "metadata": {},
+   "source": [
+    "# phy"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "9b875b9a-06a6-4415-bc3c-a467fd267fff",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "param_path = f\"{basefolder}\\\\sorted\\\\phy\\\\params.py\"\n",
+    "!phy template-gui \"{param_path}\""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "01c26673-918a-423d-bc01-e6a8d5ca51f4",
+   "metadata": {},
+   "source": [
+    "# transfer to meta"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "id": "ee580601-a601-4bbe-8261-67830643d6b7",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "'D:\\\\3556-17\\\\3556-17_recall_g0/Meta/cluster_info.tsv'"
+      ]
+     },
+     "execution_count": 17,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "import shutil\n",
+    "\n",
+    "src = basefolder + str('/sorted/phy/cluster_info.tsv')\n",
+    "dst = basefolder + str('/Meta/cluster_info.tsv')\n",
+    "\n",
+    "shutil.copy2(src, dst)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "5d4eec72-c0ca-4232-ace0-5e6ebb3e9cf8",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "dst = basefolder + str('/Meta/cluster_info.tsv')\n",
+    "save_path = Path(ks_dir) / \"bombcell\"\n",
+    "param_path = f\"{basefolder}\\\\sorted\\\\phy\\\\params.py\""
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.9.21"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
