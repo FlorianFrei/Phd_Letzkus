@@ -1,0 +1,1320 @@
+---
+title: "explore data2"
+format: html
+---
+
+# load data
+
+```{r}
+library(tidyverse)
+
+
+datapath <- r"(D:\Data\3198-52\3198-52_recall_g0\M4_recall.csv)"
+metapath <- r"(D:\Data\3198-52\3198-52_recall_g0\Meta\cluster_info.tsv)"
+# datapath <- r"(D:\Data\3198-51\3198-51_recall_g0\M3_recall.csv)"
+# metapath <- r"(D:\Data\3198-51\3198-51_recall_g0\Meta\cluster_info.tsv)"
+depthpath <- r"(D:\3556-17\histology\tiffs\slices\iblnaive\channel_locations.json)"
+structure_path <- r"(C:\Users\Freitag\Documents\GitHub\Phd_Letzkus\pre_processing\Allenbrain_structure_tree.csv)"
+
+
+
+list_of_data <- list.files(path = datapath,
+                             pattern = "\\.csv$",
+                             full.names = TRUE)
+
+list_of_meta <- list.files(path = metapath,
+                             pattern = "\\.tsv$",
+                             full.names = TRUE)
+ 
+
+load_data <- function(datapath, metapath) {
+ 
+   library(data.table)
+
+ 
+  # --- cluster meta
+  meta <- fread(metapath)  %>%
+    select(cluster_id, depth)
+
+  # --- main data
+  data <- fread(datapath) %>%
+    filter(cluster_id %in% meta$cluster_id) %>%
+    left_join(meta, by = "cluster_id") %>%
+    mutate(state = ifelse(state_name %in% c("Downsweep", "Opto_Upwsweep", "Opto_Downsweep", "Upsweep"), "Sound", state_name)) %>% mutate(trial_type = case_when(
+  trial_type ==1 ~ 'Upsweep',
+  trial_type ==2 ~ 'Downsweep',
+  trial_type ==3 ~ 'Opto_Upwsweep',
+  trial_type ==4 ~ 'Opto_Downsweep',
+))
+
+  data
+}
+
+
+load_data_with_brain_alignment <- function(datapath, metapath, depthpath, structure_path) {
+  library(data.table)
+
+  # --- depth info
+  depth_json <- jsonlite::fromJSON(depthpath, simplifyMatrix = TRUE, flatten = TRUE)
+  depth <- data.table::rbindlist(depth_json[1:(length(depth_json) - 1)], fill = TRUE) %>%
+    mutate(ch = row_number())
+
+  # --- structure tree
+  st <- fread(structure_path) %>%
+    select(id, name, acronym, depth, structure_id_path, parent_structure_id)
+
+  depth <- depth %>%
+    left_join(st, by = c("brain_region" = "acronym"))
+
+  # --- define areas (case_when for readability)
+  HUAC <- st %>%
+    mutate(area = case_when(
+      str_detect(structure_id_path, "/247/|/541/") ~ "AUD",
+      str_detect(structure_id_path, "/131/|/295/|/319/|/780/") ~ "AMY",
+      str_detect(structure_id_path, "/1089/") ~ "HIP",
+      str_detect(structure_id_path, "/1008/") ~ "MG",
+      str_detect(structure_id_path, "/549/") ~ "TH",
+      str_detect(structure_id_path, "/315/") ~ "Cortex",
+      TRUE ~ "undefined"
+    )) %>%
+    filter(!(area == "Cortex" & structure_id_path %in% structure_id_path[area == "AUD"])) %>%
+    filter(!(area == "TH" & structure_id_path %in% structure_id_path[area == "MG"])) %>%
+    select(area, structure_id_path)
+
+  depth <- depth %>%
+    left_join(HUAC, by = "structure_id_path") %>%
+    select(brain_region, area, ch)
+
+  # --- cluster meta
+  meta <- fread(metapath) %>%
+    left_join(depth, by = "ch") %>%
+    filter(bc_unitType == "GOOD") %>%
+    select(cluster_id, brain_region, area, depth)
+
+  # --- main data
+  data <- fread(datapath) %>%
+    filter(cluster_id %in% meta$cluster_id) %>%
+    left_join(meta, by = "cluster_id") %>%
+    mutate(state = ifelse(state_name %in% c("Downsweep", "Opto_Upwsweep", "Opto_Downsweep", "Upsweep"), "Sound", state_name)) %>% mutate(trial_type = case_when(
+  trial_type ==1 ~ 'Upsweep',
+  trial_type ==2 ~ 'Downsweep',
+  trial_type ==3 ~ 'Opto_Upwsweep',
+  trial_type ==4 ~ 'Opto_Downsweep',
+))
+
+  data
+}
+
+
+
+Align_to_state <- function(Data, Alignment_State) {
+  filter2 <- Data %>%
+    group_by(trial_number) %>%
+    filter(state == Alignment_State) %>%
+    slice_min(time_bin) %>%
+    mutate(minT = time_bin) %>%
+    select(minT, trial_number) %>%
+    distinct()
+
+  nearest_fixed <- function(times, fixed_times) {
+    i <- 1
+    out <- numeric(length(times))
+
+    for (j in seq_along(times)) {
+      # move pointer forward while the next fixed time is closer
+      while (i < length(fixed_times) &&
+        abs(fixed_times[i + 1] - times[j]) < abs(fixed_times[i] - times[j])) {
+        i <- i + 1
+      }
+      out[j] <- fixed_times[i]
+    }
+    out
+  }
+  Data <- Data %>%
+    mutate(
+      nearest_fixed = nearest_fixed(Data$time_bin, filter2$minT),
+      rel_time = round(time_bin - nearest_fixed, 2)
+    )
+  Data <- Data %>%
+    arrange(time_bin) %>%
+    mutate(aligntrial = cumsum(c(TRUE, diff(rel_time) < -1)))
+
+  Data <- Data %>%
+    group_by(aligntrial) %>%
+    mutate(trial_type = first(trial_type)) %>%
+    ungroup()
+
+  datarange <- Data %>%
+    group_by(aligntrial) %>%
+    reframe(range = range(rel_time)) %>%
+    group_by() %>%
+    summarise(
+      common_min = max(range[c(TRUE, FALSE)]), # max of minimums
+      common_max = min(range[c(FALSE, TRUE)]) # min of maximums
+    )
+  print(paste("common rel_time:", datarange$common_min, datarange$common_max))
+  Data
+}
+
+# data <- load_data_with_brain_alignment(
+#   datapath,
+#   metapath,
+#   depthpath,
+#   structure_path
+# )
+
+
+data <- load_data(
+  datapath,
+  metapath
+)
+data <- Align_to_state(data, "Sound")
+
+data
+
+datapath = "D:/Data/aligned/data"
+metapath = "D:/Data/aligned/meta"
+
+
+all_loaded <- map2_dfr(list_of_data, list_of_meta, ~ {
+  load_data(.x, .y) %>%
+    mutate(file_id = tools::file_path_sans_ext(basename(.x)))
+})
+
+data <- all_loaded %>% mutate(file_id2 = file_id,file_id3 = file_id) %>%  unite('cluster_id',file_id,cluster_id) %>% unite('trial_number',file_id2,trial_number) %>% separate_wider_delim(file_id3, names = c('Animal','condition'),delim ='_')
+
+data
+```
+
+# Trialless
+```{r}
+Trialless <- data  %>% 
+  # Step 1: Calculate n_trials (same as original)
+  left_join(
+    data %>%
+      group_by(trial_type) %>%
+      summarise(n_trials = n_distinct(trial_number), .groups = "drop"),
+    by = "trial_type"
+  ) %>%
+  # Step 2: Pre-aggregate event_count by the grouping variables + metadata
+  # This replaces the expensive group_by + mutate(sum()) + distinct pattern
+  group_by(trial_type, rel_time, cluster_id, n_trials, depth) %>%
+  summarise(total_event_count = sum(event_count), .groups = "drop") %>%
+  # Step 3: Calculate rate (same formula as original)
+  mutate(rate = total_event_count / n_trials / 0.01) %>%
+  # Step 4: Clean up and calculate Z-score
+  select(-total_event_count, -n_trials)
+baseline <- Trialless %>%
+  filter(between(rel_time, -15, -5)) %>%
+  group_by(cluster_id) %>%
+  summarise(cl_mean = mean(rate), cl_sd = sd(rate))
+Trialless <- Trialless %>%
+  left_join(baseline) %>%
+  group_by(cluster_id) %>%
+  mutate(Zscore = (rate - cl_mean) / cl_sd) %>%
+  ungroup() %>% replace_na(list(Zscore=0.001))
+
+
+
+g1 <- Trialless %>%
+  filter(between(rel_time, -20, 8)) %>%
+  group_by(rel_time, trial_type) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  ungroup() %>% filter(Zscore < Inf) %>%  group_by(trial_type) %>% mutate(Zscore = Zscore - mean(Zscore)) %>% ungroup()
+
+asymmetric_smooth <- function(x, window_high = 4, window_low = 25, threshold = 0.25) {
+  n <- length(x)
+  result <- numeric(n)
+
+  for (i in 1:n) {
+    if (x[i] > threshold) {
+      window <- window_high
+    } else {
+      window <- window_low
+    }
+
+    start <- max(1, i - window %/% 2)
+    end <- min(n, i + window %/% 2)
+    result[i] <- mean(x[start:end])
+  }
+  return(result)
+}
+
+g1 <- g1 %>%
+  group_by(trial_type) %>%
+  mutate(smoothed1 = asymmetric_smooth(Zscore))
+
+
+
+g1 %>% ggplot(aes(rel_time, smoothed1, col = as.factor(trial_type))) +
+  geom_line() +
+  xlim(-2.5, 6)
+
+g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
+  geom_line() +
+  xlim(-1, 5)
+
+g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
+  geom_smooth(method = "loess", span = 0.1,se=F)+
+  xlim(-0.5, 6)
+  
+
+
+data %>% group_by(trial_type) %>% distinct(state_name)
+
+g1 %>% select(-smoothed1) %>%  pivot_wider(names_from = trial_type,values_from = Zscore) %>% mutate(UP_diff = Upsweep-Opto_Upwsweep, DOWN_diff = Downsweep- Opto_Downsweep) %>% select(rel_time,UP_diff,DOWN_diff) %>% pivot_longer(cols = UP_diff:DOWN_diff, names_to = 'trial_type', values_to = 'diff') %>% ggplot(aes(rel_time,diff,col=trial_type))+
+  geom_smooth(method='loess',span=0.2)+
+  xlim(-0.5,6)
+
+
+Trialless %>% filter(between(rel_time,0,1)) %>%  group_by(depth,trial_type) %>% summarise(m = mean(Zscore)) %>% ggplot(aes(depth,m,col=trial_type))+
+  geom_line()
+
+
+
+
+
+  
+```
+
+# Trialless heatmap
+```{r}
+
+#prepare data
+
+ord <- Trialless %>% filter(cluster_id != 90) %>% 
+  filter(between(rel_time, 0, 0.1)) %>%
+  group_by(cluster_id) %>%
+  summarise(ord = mean(Zscore)) %>%
+  arrange(ord) %>%
+  mutate(cluster_id = as.factor(cluster_id)) %>%
+  pull(cluster_id)
+
+
+g2 <- Trialless %>%
+  filter(between(rel_time, -0.5, 6)) %>%
+  filter(cluster_id != 90) %>%
+  group_by(cluster_id) %>%
+  mutate(norm = (Zscore - min(Zscore)) / (max(Zscore) - min(Zscore))) %>%
+  ungroup()
+  select(trial_type, cluster_id, Zscore, norm,rel_time, brain_region, area, depth)
+
+# apply order
+g2$cluster_id <- factor(g2$cluster_id, levels = ord)
+
+
+# heatmap
+g2 %>%
+  ggplot(aes(rel_time, cluster_id, fill = Zscore)) +
+  geom_tile() +
+  geom_vline(xintercept = 0, col = "grey", linetype = "dashed") +
+  scale_fill_gradient2(low = "darkblue", mid = "beige", high = "red", midpoint = 0, limits = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.7)), breaks = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.7)), na.value = "black") +
+  labs(fill = "Z- scored FR") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(-0.5, 6, by = 0.5)) +
+  theme(axis.text.y = element_blank()) 
+
+# rescaled color
+g2 %>%
+  ggplot(aes(rel_time, cluster_id, fill = Zscore)) +
+  geom_tile() +
+  geom_vline(xintercept = 0, col = "grey", linetype = "dashed") +
+  scale_fill_gradientn(
+    colours = c("darkblue", "beige", "red"),
+    values = scales::rescale(c(min(g2$Zscore), -0.5, max(g2$Zscore))),
+    limits = c(min(g2$Zscore), max(g2$Zscore)),
+    na.value = "black"
+  ) +
+  labs(fill = "Z-scored FR") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(-0.5, 6, by = 0.5)) +
+  theme(axis.text.y = element_blank())
+
+# normalizing rows
+g2  %>%
+  ggplot(aes(rel_time, as.factor(cluster_id), fill = norm)) +
+  geom_tile() +
+  labs(fill = "Z- scored FR") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(-0.5, 6, by = 0.5)) +
+  scale_fill_gradient(low = "beige", high = "red", limits = c(0,1), breaks = c(0,1), na.value = "black") 
+
+
+# heatmaps using base R
+
+mat <- g2 %>%
+  filter(cluster_id != 90) %>%
+  group_by(rel_time, cluster_id) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  pivot_wider(names_from = rel_time, values_from = Zscore) %>%
+  column_to_rownames("cluster_id") %>%
+  as.matrix()
+heatmap(mat, Colv = NA, Rowv = NA, scale = "none")
+
+
+heatmap(mat, Colv = NA, scale = "none")
+
+heatmap(mat, Colv = NA, Rowv = NA, scale = "row")
+heatmap(mat, Colv = NA, Rowv = NA, scale = "column")
+heatmap(mat, Colv = NA, Rowv = NA, scale = "none")
+
+
+heatmap(mat, Colv = NA, scale = "none")
+
+## shwoing depth
+
+# facets
+
+g2  %>%
+  ggplot(aes(rel_time, as.factor(cluster_id), fill = Zscore)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "darkblue", mid = "beige", high = "red", midpoint = 0, limits = c(round(min(g2$Zscore) * 0.9), round(max(g2$Zscore) * 0.7)), breaks = c(round(min(g2$Zscore) * 0.9), round(max(g2$Zscore) * 0.7)), na.value = "black") +
+  labs(fill = "Z- scored FR") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(-0.5, 6, by = 0.5)) +
+  theme(axis.text.y = element_blank()) +
+  facet_grid(brain_region ~ 1, scale = "free", space = "free")
+
+
+ # no factes but lines
+
+lines <- g2 %>%
+  distinct(cluster_id, brain_region, depth, area) %>%
+  arrange(-depth) %>%
+  group_by(brain_region) %>%
+  slice_min(depth, with_ties = F) %>%
+  filter(area != "undefined")
+
+g2 %>%
+  ggplot(aes(rel_time, reorder(as.factor(cluster_id), depth), fill = Zscore)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "beige", high = "red", midpoint = , limits = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.8)), breaks = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.8)), na.value = "black") +
+  labs(fill = "Z- scored FR") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(-0.5, 6, by = 0.5)) +
+  theme(axis.text.y = element_blank()) +
+  geom_hline(data = lines, aes(yintercept = as.factor(cluster_id))) +
+  geom_text(data = lines, aes(x = -0.7, y = reorder(as.factor(cluster_id), depth), label = brain_region), inherit.aes = F, nudge_y = +1.5)
+
+
+
+```
+
+# look at single trials, all units
+
+
+```{r}
+unitless <- data %>%
+  # Step 1: Calculate n_trials (same as original)
+  left_join(
+    data %>%
+      group_by(trial_type) %>%
+      summarise(n_units = n_distinct(cluster_id), .groups = "drop"),
+    by = "trial_type"
+  ) %>%
+  # Step 2: Pre-aggregate event_count by the grouping variables + metadata
+  # This replaces the expensive group_by + mutate(sum()) + distinct pattern
+  group_by(trial_type, rel_time, aligntrial, n_units) %>%
+  summarise(total_event_count = sum(event_count), .groups = "drop") %>%
+  # Step 3: Calculate rate (same formula as original)
+  mutate(rate = total_event_count / n_units / 0.01) %>%
+  # Step 4: Clean up and calculate Z-score
+  select(-total_event_count, -n_units)
+baseline <- unitless %>%
+  filter(between(rel_time, -10, -0.1)) %>%
+  summarise(cl_mean = mean(rate), cl_sd = sd(rate))
+unitless <- unitless %>%
+  group_by(aligntrial) %>%
+  mutate(Zscore = (rate - baseline$cl_mean) / baseline$cl_sd) %>%
+  ungroup()
+
+g3 <- unitless %>%
+  filter(between(rel_time, -1, 6.5)) %>%
+  group_by(rel_time, trial_type) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  ungroup() # %>%  group_by(trial_type) %>% mutate(Zscore = Zscore - mean(Zscore))
+
+
+
+unitless %>%
+  filter(between(rel_time, 0.5, 0.6)) %>%
+  group_by(aligntrial) %>%
+  summarise(peak = mean(Zscore)) %>%
+  ggplot(aes(aligntrial, peak)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+
+unitless %>%
+  filter(between(rel_time, -0.1, 5)) %>%
+  ggplot(aes(rel_time, Zscore, col = aligntrial)) +
+  geom_smooth(span = 0.2, aes(group = aligntrial), se = F) +
+  theme_minimal()
+
+
+unitless %>%
+  filter(between(rel_time, -0.1, 5)) %>%
+  group_by(aligntrial) %>%
+  summarise(m = mean(Zscore)) %>%
+  ggplot(aes(aligntrial, m)) +
+  geom_point() +
+  theme_minimal()
+
+unitless %>%
+  mutate(peak = case_when(
+    between(rel_time, 0, 0.1) ~ 1,
+    between(rel_time, 1, 1.1) ~ 2,
+    between(rel_time, 2, 2.1) ~ 3,
+    between(rel_time, 3, 3.1) ~ 4,
+    between(rel_time, 4, 4.1) ~ 5
+  )) %>%
+  na.omit() %>%
+  group_by(aligntrial, peak) %>%
+  summarise(m = mean(Zscore)) %>%
+  ggplot(aes(aligntrial, m)) +
+  geom_point() +
+  geom_smooth(method = "lm")+
+facet_wrap(~peak, scales = "free")
+
+
+unitless %>%
+  mutate(peak = case_when(
+    between(rel_time, 0, 0.1) ~ 1,
+    between(rel_time, 1, 1.1) ~ 2,
+    between(rel_time, 2, 2.1) ~ 3,
+    between(rel_time, 3, 3.1) ~ 4,
+    between(rel_time, 4, 4.1) ~ 5
+  )) %>%
+  na.omit() %>%
+  group_by(aligntrial,peak) %>%
+  summarise(m = mean(Zscore)) %>%  group_by(peak) %>%
+  mutate(m2 = mean(m)) %>% ggplot(aes(as.factor(peak),m))+
+  geom_boxplot()+
+  geom_line(aes(peak,m2),col='red')+
+geom_point(aes(peak,m2),col='red')
+
+
+
+unitless %>%
+  mutate(peak = case_when(
+    between(rel_time, 0.5, 0.6) ~ 1,
+    between(rel_time, 1.5, 1.6) ~ 2,
+    between(rel_time, 2.5, 2.6) ~ 3,
+    between(rel_time, 3.5, 3.6) ~ 4,
+    between(rel_time, 4.5, 4.6) ~ 5
+  )) %>%
+  na.omit() %>%
+  group_by(aligntrial,peak) %>%
+  summarise(m = mean(Zscore)) %>%  group_by(peak) %>%
+  mutate(m2 = mean(m)) %>% ggplot(aes(as.factor(peak),m))+
+  geom_boxplot()+
+  geom_line(aes(peak,m2),col='red')
+
+
+unitless %>%
+  mutate(peak = case_when(
+    between(rel_time, 0.5, 0.6) ~ 1,
+    between(rel_time, 1.5, 1.6) ~ 2,
+    between(rel_time, 2.5, 2.6) ~ 3,
+    between(rel_time, 3.5, 3.6) ~ 4,
+    between(rel_time, 4.5, 4.6) ~ 5
+  )) %>%
+  na.omit() %>%
+  group_by(aligntrial, peak) %>%
+  summarise(m = mean(Zscore)) %>%
+  ggplot(aes(aligntrial, m)) +
+  geom_point() +
+  geom_smooth(method = "lm")+
+facet_wrap(~peak, scales = "free")
+```
+
+
+# ZETA
+```{r}
+all <- read_csv(r"(D:\3556-17\3556-17_naive_g0\Zeta_sound_All.csv)") %>%
+  mutate(mod = "spec") %>%
+  filter(p_val < 0.05)
+on <- read_csv(r"(D:\3556-17\3556-17_naive_g0\Zeta_sound_Onset.csv)") %>%
+  mutate(mod = "on") %>%
+  filter(p_val < 0.05)
+off <- read_csv(r"(D:\3556-17\3556-17_naive_g0\Zeta_sound_Offset.csv)") %>%
+  mutate(mod = "off") %>%
+  filter(p_val < 0.05)
+
+on_only <- on %>% anti_join(off, by = join_by(unit))
+off_only <- off %>% anti_join(on, by = join_by(unit))
+
+on_of <- rbind(on_only, off_only)
+
+all2 <- all %>% filter(!unit %in% on_of$unit)
+
+zeta <- rbind(on_of, all2)
+
+zeta %>%   mutate(p_adj = round(p.adjust(p_val, method = "BH"),4), p_diff = round(p_val-p_adj,4)) %>% arrange(p_diff) 
+
+
+zeta_filter <- data %>%
+  distinct(cluster_id) %>%
+  left_join(zeta, by = join_by("cluster_id" == "unit")) %>%
+  na.omit() %>%
+  select(-p_val)
+
+T2 <- Trialless %>%
+  left_join(zeta_filter) %>%
+  replace_na(list(mod = "NA"))
+
+g1 <- T2 %>%
+  filter(between(rel_time, -1, 6.5)) %>%
+  group_by(rel_time, mod) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  ungroup() # %>%  group_by(trial_type) %>% mutate(Zscore = Zscore - mean(Zscore))
+
+
+
+df_summary <- T2 %>%
+  distinct(cluster_id, mod, trial_type) %>%
+  count(trial_type, mod) %>% ungroup()
+
+
+g1 %>% ggplot(aes(rel_time, Zscore, col = mod)) +
+  geom_line() +
+  theme_minimal() +
+  facet_wrap(~mod) +
+  geom_text(
+    data = df_summary, x = -0.5, y = 6, aes(label = n),
+    hjust = 1, color = "black", size = 6
+  )
+
+
+
+ARR <- Trialless %>%
+  filter(cluster_id == 24, between(rel_time, -2, 6)) %>%
+  group_by(rel_time) %>%
+  summarise(Zscore = mean(Zscore), rate = mean(rate)) %>%
+  mutate(smooth = zoo::rollmean.default(Zscore, 8, "extend"))
+ARR %>% ggplot(aes(rel_time, smooth)) +
+  geom_line()
+
+
+ARR <- Trialless %>%
+  filter(cluster_id == 24, between(rel_time, -2, 6)) %>%
+  group_by(rel_time) %>%
+  summarise(Zscore = mean(Zscore), rate = mean(rate)) %>%
+  mutate(smooth = zoo::rollmean.default(Zscore, 25, "extend"))
+ARR %>% ggplot(aes(rel_time, smooth)) +
+  geom_line()
+
+ARR <- Trialless %>%
+  filter(cluster_id == 24, between(rel_time, -2, 6)) %>%
+  group_by(rel_time) %>%
+  summarise(Zscore = mean(Zscore), rate = mean(rate)) %>%
+  mutate(smooth = zoo::rollmean.default(Zscore, 1, "extend"))
+ARR %>% ggplot(aes(rel_time, smooth)) +
+  geom_line()+
+  geom_vline(aes(xintercept = 0.5))
+
+
+zoo::rollmean.default(ARR$Zscore, 3)
+```
+
+# using UMAP to find response pattern types
+```{r}
+# first try using all data
+library(umap)
+
+iris.data <- iris[, grep("Sepal|Petal", colnames(iris))]
+iris.labels <- iris[, "Species"]
+
+iris
+
+AA <- T2 %>%
+  filter(cluster_id != 90) %>%
+  filter(mod != "NA") %>%
+  filter(between(rel_time, -0.2, 6)) %>%
+  group_by(rel_time, cluster_id, mod) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  group_by(cluster_id) %>%
+  mutate(Zscore = zoo::rollmean.default(Zscore, 25, "extend")) %>%
+  ungroup() %>%
+  pivot_wider(names_from = rel_time, values_from = Zscore)
+AA
+AA.data <- AA %>% select(-cluster_id, -mod)
+AA.labels <- AA %>% select(mod, cluster_id)
+
+AA.umap <- umap(AA.data)
+
+
+
+plotda <- tibble(A1 = AA.umap$layout[, 1], A2 = AA.umap$layout[, 2], mod = AA.labels$mod, units = AA.labels$cluster_id)
+plotda %>% ggplot(aes(A1, A2, col = mod)) +
+  geom_point() +
+  geom_text(aes(label = units))
+
+
+# selecting peaks as features.
+
+JP <- T2 %>%
+  mutate(peak = case_when(
+    between(rel_time, 0, 0.1) ~ 2,
+    between(rel_time, 1, 1.1) ~ 3,
+    between(rel_time, 2, 2.1) ~ 4,
+    between(rel_time, 3, 3.1) ~ 5,
+    between(rel_time, 4, 4.1) ~ 6,
+    between(rel_time, 0.5, 0.6) ~ 7,
+    between(rel_time, 1.5, 1.6) ~ 8,
+    between(rel_time, 2.5, 2.6) ~ 9,
+    between(rel_time, 3.5, 3.6) ~ 10,
+    between(rel_time, 4.5, 4.6) ~ 11,
+    between(rel_time, -2, -0.01) ~ 1,
+    between(rel_time, 5, 5.5) ~ 12
+  )) %>%
+  na.omit() %>%
+  group_by(cluster_id, peak, mod) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  group_by(cluster_id) %>%
+  mutate(norm = (Zscore - min(Zscore)) / (max(Zscore) - min(Zscore))) %>%
+  ungroup()
+
+JP
+
+AA <- JP %>%
+  select(-Zscore) %>%
+  filter(cluster_id != 90) %>%
+  filter(mod != "NA") %>%
+  pivot_wider(names_from = peak, values_from = norm)
+AA
+AA.data <- AA %>% select(-cluster_id, -mod)
+AA.labels <- AA %>% select(mod, cluster_id)
+
+AA.umap <- umap(AA.data)
+
+
+
+plotda <- tibble(A1 = AA.umap$layout[, 1], A2 = AA.umap$layout[, 2], mod = AA.labels$mod, units = AA.labels$cluster_id)
+plotda %>% ggplot(aes(A1, A2, col = mod)) +
+  geom_point() +
+  geom_text(aes(label = units))
+
+AA.umap$knn$indexes
+
+kmd <- plotda %>%
+  select(A1, A2) %>%
+  as.matrix()
+kmr <- kmeans(kmd, 5, iter.max = 25, nstart = 3)
+
+plotda %>%
+  mutate(kmc = kmr$cluster) %>%
+  ggplot(aes(A1, A2, col = as.factor(kmc))) +
+  geom_point() +
+  geom_text(aes(label = units))
+
+
+filt_kmean <- plotda %>%
+  mutate(kmc = kmr$cluster) %>%
+  select(cluster_id = units, kmc)
+
+Trialless %>%
+  filter(cluster_id != 90) %>%
+  filter(between(rel_time, -1, 6.5)) %>%
+  left_join(filt_kmean) %>%
+  group_by(rel_time, kmc) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  ungroup() %>%
+  ggplot(aes(rel_time, Zscore, col = as.factor(kmc))) +
+  geom_line() +
+  facet_wrap(~kmc)
+
+
+
+
+JP %>%
+  group_by(cluster_id) %>%
+  mutate(norm = (Zscore - min(Zscore)) / (max(Zscore) - min(Zscore))) %>%
+  ggplot(aes(peak, norm, col = as.factor(cluster_id))) +
+  geom_line()
+
+
+
+# use means off all peaks as feautures
+
+
+JP <- T2 %>%
+  mutate(peak = case_when(
+    between(rel_time, 0, 0.1) ~ 2,
+    between(rel_time, 1, 1.1) ~ 2,
+    between(rel_time, 2, 2.1) ~ 2,
+    between(rel_time, 3, 3.1) ~ 2,
+    between(rel_time, 4, 4.1) ~ 2,
+    between(rel_time, 0.5, 0.6) ~ 3,
+    between(rel_time, 1.5, 1.6) ~ 3,
+    between(rel_time, 2.5, 2.6) ~ 3,
+    between(rel_time, 3.5, 3.6) ~ 3,
+    between(rel_time, 4.5, 4.6) ~ 3,
+    between(rel_time, -2, -0.01) ~ 1,
+    between(rel_time, 5, 5.5) ~ 4
+  )) %>%
+  na.omit() %>%
+  group_by(cluster_id, peak, mod) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  group_by(cluster_id) %>%
+  mutate(norm = (Zscore - min(Zscore)) / (max(Zscore) - min(Zscore))) %>%
+  ungroup()
+
+JP
+
+
+AA <- JP %>%
+  select(-Zscore) %>%
+  filter(cluster_id != 90) %>%
+  filter(mod != "NA") %>%
+  pivot_wider(names_from = peak, values_from = norm)
+AA
+AA.data <- AA %>% select(-cluster_id, -mod)
+AA.labels <- AA %>% select(mod, cluster_id)
+
+AA.umap <- umap(AA.data)
+
+
+
+plotda <- tibble(A1 = AA.umap$layout[, 1], A2 = AA.umap$layout[, 2], mod = AA.labels$mod, units = AA.labels$cluster_id)
+plotda %>% ggplot(aes(A1, A2, col = mod)) +
+  geom_point() +
+  geom_text(aes(label = units))
+
+AA.umap$knn$indexes
+
+kmd <- plotda %>%
+  select(A1, A2) %>%
+  as.matrix()
+kmr <- kmeans(kmd, 4, iter.max = 25, nstart = 3)
+
+plotda %>%
+  mutate(kmc = kmr$cluster) %>%
+  ggplot(aes(A1, A2, col = as.factor(kmc))) +
+  geom_point() +
+  geom_text(aes(label = units))
+
+
+filt_kmean <- plotda %>%
+  mutate(kmc = kmr$cluster) %>%
+  select(cluster_id = units, kmc)
+
+Trialless %>%
+  filter(cluster_id != 90) %>%
+  filter(between(rel_time, -1, 6.5)) %>%
+  left_join(filt_kmean) %>%
+  group_by(rel_time, kmc) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  ungroup() %>%
+  ggplot(aes(rel_time, Zscore, col = as.factor(kmc))) +
+  geom_line() +
+  facet_wrap(~kmc)
+
+# use aligned peaks and post_peaks
+
+
+
+JP <- T2 %>%
+  mutate(peak = case_when(
+    between(rel_time, 0, 0.1) ~ 2,
+    between(rel_time, 1, 1.1) ~ 2,
+    between(rel_time, 2, 2.1) ~ 2,
+    between(rel_time, 3, 3.1) ~ 2,
+    between(rel_time, 4, 4.1) ~ 2,
+    between(rel_time, 0.11, 0.49) ~ 3,
+    between(rel_time, 1.11, 1.49) ~ 3,
+    between(rel_time, 2.11, 2.49) ~ 3,
+    between(rel_time, 3.11, 3.49) ~ 3,
+    between(rel_time, 4.11, 4.49) ~ 3,
+    between(rel_time, 0.5, 0.6) ~ 4,
+    between(rel_time, 1.5, 1.6) ~ 4,
+    between(rel_time, 2.5, 2.6) ~ 4,
+    between(rel_time, 3.5, 3.6) ~ 4,
+    between(rel_time, 4.5, 4.6) ~ 4,
+    between(rel_time, 0.61, 0.99) ~ 5,
+    between(rel_time, 1.61, 1.99) ~ 5,
+    between(rel_time, 2.61, 2.99) ~ 5,
+    between(rel_time, 3.61, 3.99) ~ 5,
+    between(rel_time, 4.61, 4.99) ~ 5,
+    between(rel_time, -2, -0.01) ~ 1,
+    between(rel_time, 5, 5.5) ~ 6
+  )) %>%
+  na.omit() %>%
+  group_by(cluster_id, peak, mod) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  group_by(cluster_id) %>%
+  mutate(norm = (Zscore - min(Zscore)) / (max(Zscore) - min(Zscore))) %>%
+  ungroup()
+
+AA <- JP2 %>%
+  select(-Zscore) %>%
+  filter(cluster_id != 90) %>%
+  filter(mod != "NA") %>%
+  pivot_wider(names_from = peak, values_from = norm)
+AA
+AA.data <- AA %>% select(-cluster_id, -mod)
+AA.labels <- AA %>% select(mod, cluster_id)
+
+AA.umap <- umap(AA.data)
+
+
+
+plotda <- tibble(A1 = AA.umap$layout[, 1], A2 = AA.umap$layout[, 2], mod = AA.labels$mod, units = AA.labels$cluster_id)
+plotda %>% ggplot(aes(A1, A2, col = mod)) +
+  geom_point() +
+  geom_text(aes(label = units))
+
+AA.umap$knn$indexes
+
+kmd <- plotda %>%
+  select(A1, A2) %>%
+  as.matrix()
+kmr <- kmeans(kmd, 5, iter.max = 25, nstart = 3)
+
+plotda %>%
+  mutate(kmc = kmr$cluster) %>%
+  ggplot(aes(A1, A2, col = as.factor(kmc))) +
+  geom_point() +
+  geom_text(aes(label = units))
+
+
+filt_kmean <- plotda %>%
+  mutate(kmc = kmr$cluster) %>%
+  select(cluster_id = units, kmc)
+
+Trialless %>%
+  filter(cluster_id != 90) %>%
+  filter(between(rel_time, -1, 6.5)) %>%
+  left_join(filt_kmean) %>%
+  group_by(rel_time, kmc) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  ungroup() %>%
+  ggplot(aes(rel_time, Zscore, col = as.factor(kmc))) +
+  geom_line() +
+  facet_wrap(~kmc)
+
+JP
+group_by()
+bl <- JP %>%
+  filter(cluster_id != 90) %>%
+  group_by(cluster_id) %>%
+  filter(peak == 1) %>%
+  mutate(bl = norm) %>%
+  select(cluster_id, bl)
+JP2 <- JP %>%
+  filter(cluster_id != 90) %>%
+  left_join(bl) %>%
+  group_by(cluster_id) %>%
+  mutate(norm = norm - bl) %>%
+  ggplot(aes(peak, norm, col = as.factor(cluster_id))) +
+  geom_line()
+
+
+## super cut
+sc <- JP %>%
+  filter(cluster_id != 90) %>%
+  left_join(bl) %>%
+  group_by(cluster_id) %>%
+  mutate(norm = norm - bl) %>%
+  mutate(catr = case_when(
+    between(norm, 0.3, 1) ~ 1,
+    between(norm, -0.299, 0.299) ~ 0,
+    between(norm, -1, -0.3) ~ -1,
+  )) %>%
+  filter(peak > 1)
+
+sc %>% ggplot(aes(peak, catr, col = as.factor(cluster_id))) +
+  geom_line()
+
+
+AA <- sc %>%
+  select(cluster_id, peak, mod, catr) %>%
+  filter(cluster_id != 90) %>%
+  filter(mod != "NA") %>%
+  pivot_wider(names_from = peak, values_from = catr)
+AA
+AA.data <- AA %>% select(-cluster_id, -mod)
+AA.labels <- AA %>% select(mod, cluster_id)
+
+AA.umap <- umap(AA.data)
+
+
+
+plotda <- tibble(A1 = AA.umap$layout[, 1], A2 = AA.umap$layout[, 2], mod = AA.labels$mod, units = AA.labels$cluster_id)
+plotda %>% ggplot(aes(A1, A2, col = mod)) +
+  geom_point() +
+  geom_text(aes(label = units))
+
+AA.umap$knn$indexes
+
+kmd <- plotda %>%
+  select(A1, A2) %>%
+  as.matrix()
+kmr <- kmeans(kmd, 4, iter.max = 25, nstart = 3)
+
+plotda %>%
+  mutate(kmc = kmr$cluster) %>%
+  ggplot(aes(A1, A2, col = as.factor(kmc))) +
+  geom_point() +
+  geom_text(aes(label = units))
+
+
+filt_kmean <- plotda %>%
+  mutate(kmc = kmr$cluster) %>%
+  select(cluster_id = units, kmc)
+
+Trialless %>%
+  filter(cluster_id != 90) %>%
+  filter(between(rel_time, -1, 6.5)) %>%
+  left_join(filt_kmean) %>%
+  group_by(rel_time, kmc) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  ungroup() %>%
+  ggplot(aes(rel_time, Zscore, col = as.factor(kmc))) +
+  geom_line() +
+  facet_wrap(~kmc)
+```
+
+
+```{r}
+AA <- T2 %>%
+  filter(cluster_id != 90) %>%
+  filter(mod != "NA") %>%
+  filter(between(rel_time, 0, 5)) %>%
+  group_by(rel_time, cluster_id, mod) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  group_by(cluster_id) %>%
+  mutate(Zscore = zoo::rollmean.default(Zscore, 25, "extend")) %>%
+  ungroup() %>%
+  pivot_wider(names_from = rel_time, values_from = Zscore)
+
+
+pc <- prcomp(AA.data, scale. = T)
+
+r <- as_tibble(pc$x)
+
+
+
+plotda <- tibble(A1 = r$PC1, A2 = r$PC2, A3 = r$PC3, mod = AA.labels$mod, units = AA.labels$cluster_id)
+plotda %>% ggplot(aes(A1, A2, col = mod)) +
+  geom_point() +
+  geom_text(aes(label = units))
+
+plotda %>% ggplot(aes(A1, A3, col = mod)) +
+  geom_point() +
+  geom_text(aes(label = units))
+
+plotda %>% ggplot(aes(A3, A2, col = mod)) +
+  geom_point() +
+  geom_text(aes(label = units))
+
+
+
+
+T2 %>%
+  filter(cluster_id != 90) %>%
+  filter(mod != "NA") %>%
+  filter(between(rel_time, 0, 1)) %>%
+  group_by(rel_time, cluster_id, mod) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  group_by(cluster_id) %>%
+  mutate(Zscore = zoo::rollmean.default(Zscore, 1, "extend")) %>%
+  mutate(norm = (Zscore - min(Zscore)) / (max(Zscore) - min(Zscore))) %>%
+  ungroup() %>%
+  ggplot(aes(rel_time, Zscore, group = cluster_id, col = as.factor(mod))) +
+  geom_line()
+```
+
+
+
+
+```{r}
+g2 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
+  geom_line()
+
+g2 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
+  geom_smooth(method = "loess", span = 0.1)
+g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
+  geom_smooth(method = "loess", span = 0.1)
+
+
+library(pracma)
+
+gaussian_filter1d <- function(x, sigma) {
+  ksize <- ceiling(sigma * 6)
+  t <- -ksize:ksize
+  kernel <- exp(-t^2 / (2 * sigma^2))
+  kernel <- kernel / sum(kernel)
+
+  # reflect padding (like scipy.ndimage default mode="reflect")
+  xpad <- c(rev(head(x, ksize)), x, rev(tail(x, ksize)))
+
+  # full convolution
+  ypad <- stats::convolve(xpad, rev(kernel), type = "open")
+
+  # crop back to original length
+  start <- ksize + 1
+  end <- start + length(x) - 1
+  ypad[start:end]
+}
+
+
+?convolve
+
+g1 <- g1 %>%
+  group_by(trial_type) %>%
+  mutate(smooth = gaussian_filter1d(Zscore, sigma = 4))
+g2 <- g2 %>%
+  group_by(trial_type) %>%
+  mutate(smooth = gaussian_filter1d(Zscore, sigma = 4))
+
+
+
+g1 %>% ggplot(aes(rel_time, smooth, col = as.factor(trial_type))) +
+  geom_line()
+
+g2 %>% ggplot(aes(rel_time, smooth, col = as.factor(trial_type))) +
+  geom_line()
+
+
+data %>% write_csv(r"(D:\3556-17\3556-17_naive_g0\Data.csv)")
+Trialless %>% write_csv(r"(D:\3556-17\3556-17_naive_g0\Trialless.csv)")
+g1 %>% write_csv(r"(D:\3556-17\3556-17_naive_g0\g1.csv)")
+
+
+g1 %>% ggplot(aes(rel_time, smooth, col = as.factor(trial_type))) +
+  geom_line()
+g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
+  geom_smooth(method = "loess", span = 0.05, se = F)
+
+
+
+g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
+  geom_line() +
+  xlim(4.2, 5)
+```
+
+
+
+```{r}
+datarange <- data %>%
+  arrange(time_bin) %>%
+  mutate(aligntrial = cumsum(c(TRUE, diff(rel_time) < -1)))
+
+
+data2 <- datarange %>%
+  group_by(aligntrial) %>%
+  mutate(trial_type = first(trial_type)) %>%
+  ungroup()
+
+
+Trialless <- data2 %>%
+  # Step 1: Calculate n_trials (same as original)
+  left_join(
+    data %>%
+      group_by(trial_type) %>%
+      summarise(n_trials = n_distinct(trial_number), .groups = "drop"),
+    by = "trial_type"
+  ) %>%
+  # Step 2: Pre-aggregate event_count by the grouping variables + metadata
+  # This replaces the expensive group_by + mutate(sum()) + distinct pattern
+  group_by(trial_type, rel_time, cluster_id, n_trials, brain_region, area) %>%
+  summarise(total_event_count = sum(event_count), .groups = "drop") %>%
+  # Step 3: Calculate rate (same formula as original)
+  mutate(rate = total_event_count / n_trials / 0.01) %>%
+  # Step 4: Clean up and calculate Z-score
+  select(-total_event_count, -n_trials) %>%
+  group_by(cluster_id) %>%
+  mutate(Zscore = (rate - mean(rate)) / sd(rate)) %>%
+  ungroup()
+
+
+
+g1 <- Trialless %>%
+  filter(between(rel_time, -10, 10)) %>%
+  group_by(rel_time, trial_type) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  group_by(trial_type) %>%
+  mutate(Zscore = Zscore - mean(Zscore))
+g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
+  geom_line() +
+  xlim(-0.5, 6)
+
+
+data %>%
+  filter(between(rel_time, -5, 6)) %>%
+  group_by(trial_type) %>%
+  count(rel_time) %>%
+  ggplot(aes(rel_time, n, col = as.factor(trial_type))) +
+  geom_line()
+
+data %>%
+  filter(time_bin > 206) %>%
+  filter(cluster_id == 41)
+
+
+datarange <- data %>%
+  arrange(time_bin) %>%
+  mutate(aligntrial = cumsum(c(TRUE, diff(rel_time) < -1))) %>%
+  group_by(aligntrial) %>%
+  reframe(range = range(rel_time)) %>%
+  group_by() %>%
+  summarise(
+    common_min = max(range[c(TRUE, FALSE)]), # max of minimums
+    common_max = min(range[c(FALSE, TRUE)]) # min of maximums
+  )
+
+datarange <- data %>%
+  arrange(time_bin) %>%
+  mutate(aligntrial = cumsum(c(TRUE, diff(rel_time) < -1)))
+
+datarange
+
+data2 %>%
+  filter(between(rel_time, -5, 6)) %>%
+  group_by(trial_type) %>%
+  count(rel_time) %>%
+  count(trial_type, n)
+
+
+data %>% count(cluster_id, time_bin)
+
+data %>%
+  group_by(cluster_id) %>%
+  count(time_bin)
+
+
+library(data.table)
+
+setDT(data) # convert to data.table by reference
+
+res <- data[, .N, by = .(trial_type, cluster_id, time_bin)]
+
+
+res %>%
+  count(cluster_id, trial_type) %>%
+  count(trial_type)
+
+
+
+data2 %>%
+  filter(between(rel_time, 5, 6)) %>%
+  group_by(trial_type) %>%
+  count(rel_time) %>%
+  ggplot(aes(rel_time, n, col = as.factor(trial_type))) +
+  facet_wrap(~trial_type) +
+  geom_line()
+
+g1 %>% ggplot(aes(rel_time, smoothed1, col = as.factor(trial_type))) +
+  geom_line() +
+  xlim(-0.5, 6)
+```
+
+```{r}
+Trialless <- data %>%
+  # Step 1: Calculate n_trials (same as original)
+  left_join(
+    data %>%
+      group_by(trial_type) %>%
+      summarise(n_trials = n_distinct(trial_number), .groups = "drop"),
+    by = "trial_type"
+  ) %>%
+  # Step 2: Pre-aggregate event_count by the grouping variables + metadata
+  # This replaces the expensive group_by + mutate(sum()) + distinct pattern
+  group_by(trial_type, rel_time, cluster_id, n_trials, brain_region, area) %>%
+  summarise(total_event_count = sum(event_count), .groups = "drop") %>%
+  # Step 3: Calculate rate (same formula as original)
+  mutate(rate = total_event_count / n_trials / 0.001) %>%
+  # Step 4: Clean up and calculate Z-score
+  select(-total_event_count, -n_trials) %>%
+  group_by(trial_type, cluster_id) %>%
+  mutate(Zscore = (rate - mean(rate)) / sd(rate)) %>%
+  ungroup()
+
+
+
+g1 <- Trialless %>%
+  filter(between(rel_time, -10, 10)) %>%
+  group_by(rel_time, trial_type) %>%
+  summarise(Zscore = mean(Zscore)) %>%
+  group_by(trial_type) %>%
+  mutate(Zscore = Zscore - mean(Zscore))
+g2 <- Trialless %>%
+  filter(between(rel_time, -10, 10)) %>%
+  group_by(rel_time, trial_type) %>%
+  summarise(Zscore = mean(Zscore))
+
+g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
+  geom_line() +
+  xlim(-0.5, 6)
+
+
+g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
+  geom_smooth(method = "loess", span = 0.05) +
+  xlim(-0.5, 6)
+
+
+asymmetric_smooth <- function(x, window_high = 3, window_low = 20, threshold = 0.3) {
+  n <- length(x)
+  result <- numeric(n)
+
+  for (i in 1:n) {
+    if (x[i] > threshold) {
+      window <- window_high
+    } else {
+      window <- window_low
+    }
+
+    start <- max(1, i - window %/% 2)
+    end <- min(n, i + window %/% 2)
+    result[i] <- mean(x[start:end])
+  }
+  return(result)
+}
+
+g2$smoothed1 <- asymmetric_smooth(g2$Zscore)
+
+
+g2$smoothed2 <- signal::sgolayfilt(g2$Zscore, p = 2, n = 9)
+
+library(zoo)
+
+# Rolling max to preserve peaks
+g2$smoothed3 <- rollmax(g2$Zscore, k = 10, fill = NA, align = "center")
+
+# Or combine max and mean
+g2$smoothed4 <- 0.7 * rollmax(g2$Zscore, k = 8, fill = NA, align = "center") +
+  0.3 * rollmean(g2$Zscore, k = 8, fill = NA, align = "center")
+
+
+
+g2 %>%
+  pivot_longer(cols = Zscore:smoothed2, names_to = "SA", values_to = "value") %>%
+  ggplot(aes(rel_time, value, col = SA)) +
+  geom_line() +
+  xlim(-0.5, 5)
+
+
+
+g2 %>%
+  pivot_longer(cols = Zscore:smoothed2, names_to = "SA", values_to = "value") %>%
+  ggplot(aes(rel_time, value)) +
+  geom_line() +
+  xlim(-0.5, 5) +
+  facet_wrap(~SA)
+
+
+library(dplyr)
+
+
+
+
+
+g2 %>% ggplot(aes(rel_time, smoothed1, col = as.factor(trial_type))) +
+  geom_line() +
+  xlim(-0.5, 6)
+
+g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
+  geom_smooth(method = "loess", span = 0.2) +
+  xlim(-0.5, 6)
+```

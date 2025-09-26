@@ -5,15 +5,17 @@ Created on Tue Aug 26 16:50:47 2025
 @author: Freitag
 """
 
+# Change working directory to the folder where this script is saved
 import os
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
 import glob
 import shutil
 import deeplabcut
 import helpers 
 
 
-# Change working directory to the folder where this script is saved
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
 
 
 
@@ -28,7 +30,7 @@ CONFIG_PATH = r"C:\Users\Freitag\Documents\GitHub\EyeVideoAnalysis\dlc\config.ya
 
 def main():
     # Find all videos
-    videos = glob.glob(os.path.join(VIDEO_FOLDER, "*.avi"))
+    videos = glob.glob(os.path.join(VIDEO_FOLDER, "*.mp4"))
     print(f"Found {len(videos)} videos")
     
     if not videos:
