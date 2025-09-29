@@ -7,10 +7,10 @@ format: html
 
 ```{r}
 library(tidyverse)
+source("helpers.R")
 
-
-datapath <- r"(D:\Data\3198-52\3198-52_recall_g0\M4_recall.csv)"
-metapath <- r"(D:\Data\3198-52\3198-52_recall_g0\Meta\cluster_info.tsv)"
+datapath <- r"(D:\Data\3198-51\3198-51_recall_g0\M3_recall.csv)"
+metapath <- r"(D:\Data\3198-51\3198-51_recall_g0\Meta\cluster_info.tsv)"
 # datapath <- r"(D:\Data\3198-51\3198-51_recall_g0\M3_recall.csv)"
 # metapath <- r"(D:\Data\3198-51\3198-51_recall_g0\Meta\cluster_info.tsv)"
 depthpath <- r"(D:\3556-17\histology\tiffs\slices\iblnaive\channel_locations.json)"
@@ -27,134 +27,6 @@ list_of_meta <- list.files(path = metapath,
                              full.names = TRUE)
  
 
-load_data <- function(datapath, metapath) {
- 
-   library(data.table)
-
- 
-  # --- cluster meta
-  meta <- fread(metapath)  %>%
-    select(cluster_id, depth)
-
-  # --- main data
-  data <- fread(datapath) %>%
-    filter(cluster_id %in% meta$cluster_id) %>%
-    left_join(meta, by = "cluster_id") %>%
-    mutate(state = ifelse(state_name %in% c("Downsweep", "Opto_Upwsweep", "Opto_Downsweep", "Upsweep"), "Sound", state_name)) %>% mutate(trial_type = case_when(
-  trial_type ==1 ~ 'Upsweep',
-  trial_type ==2 ~ 'Downsweep',
-  trial_type ==3 ~ 'Opto_Upwsweep',
-  trial_type ==4 ~ 'Opto_Downsweep',
-))
-
-  data
-}
-
-
-load_data_with_brain_alignment <- function(datapath, metapath, depthpath, structure_path) {
-  library(data.table)
-
-  # --- depth info
-  depth_json <- jsonlite::fromJSON(depthpath, simplifyMatrix = TRUE, flatten = TRUE)
-  depth <- data.table::rbindlist(depth_json[1:(length(depth_json) - 1)], fill = TRUE) %>%
-    mutate(ch = row_number())
-
-  # --- structure tree
-  st <- fread(structure_path) %>%
-    select(id, name, acronym, depth, structure_id_path, parent_structure_id)
-
-  depth <- depth %>%
-    left_join(st, by = c("brain_region" = "acronym"))
-
-  # --- define areas (case_when for readability)
-  HUAC <- st %>%
-    mutate(area = case_when(
-      str_detect(structure_id_path, "/247/|/541/") ~ "AUD",
-      str_detect(structure_id_path, "/131/|/295/|/319/|/780/") ~ "AMY",
-      str_detect(structure_id_path, "/1089/") ~ "HIP",
-      str_detect(structure_id_path, "/1008/") ~ "MG",
-      str_detect(structure_id_path, "/549/") ~ "TH",
-      str_detect(structure_id_path, "/315/") ~ "Cortex",
-      TRUE ~ "undefined"
-    )) %>%
-    filter(!(area == "Cortex" & structure_id_path %in% structure_id_path[area == "AUD"])) %>%
-    filter(!(area == "TH" & structure_id_path %in% structure_id_path[area == "MG"])) %>%
-    select(area, structure_id_path)
-
-  depth <- depth %>%
-    left_join(HUAC, by = "structure_id_path") %>%
-    select(brain_region, area, ch)
-
-  # --- cluster meta
-  meta <- fread(metapath) %>%
-    left_join(depth, by = "ch") %>%
-    filter(bc_unitType == "GOOD") %>%
-    select(cluster_id, brain_region, area, depth)
-
-  # --- main data
-  data <- fread(datapath) %>%
-    filter(cluster_id %in% meta$cluster_id) %>%
-    left_join(meta, by = "cluster_id") %>%
-    mutate(state = ifelse(state_name %in% c("Downsweep", "Opto_Upwsweep", "Opto_Downsweep", "Upsweep"), "Sound", state_name)) %>% mutate(trial_type = case_when(
-  trial_type ==1 ~ 'Upsweep',
-  trial_type ==2 ~ 'Downsweep',
-  trial_type ==3 ~ 'Opto_Upwsweep',
-  trial_type ==4 ~ 'Opto_Downsweep',
-))
-
-  data
-}
-
-
-
-Align_to_state <- function(Data, Alignment_State) {
-  filter2 <- Data %>%
-    group_by(trial_number) %>%
-    filter(state == Alignment_State) %>%
-    slice_min(time_bin) %>%
-    mutate(minT = time_bin) %>%
-    select(minT, trial_number) %>%
-    distinct()
-
-  nearest_fixed <- function(times, fixed_times) {
-    i <- 1
-    out <- numeric(length(times))
-
-    for (j in seq_along(times)) {
-      # move pointer forward while the next fixed time is closer
-      while (i < length(fixed_times) &&
-        abs(fixed_times[i + 1] - times[j]) < abs(fixed_times[i] - times[j])) {
-        i <- i + 1
-      }
-      out[j] <- fixed_times[i]
-    }
-    out
-  }
-  Data <- Data %>%
-    mutate(
-      nearest_fixed = nearest_fixed(Data$time_bin, filter2$minT),
-      rel_time = round(time_bin - nearest_fixed, 2)
-    )
-  Data <- Data %>%
-    arrange(time_bin) %>%
-    mutate(aligntrial = cumsum(c(TRUE, diff(rel_time) < -1)))
-
-  Data <- Data %>%
-    group_by(aligntrial) %>%
-    mutate(trial_type = first(trial_type)) %>%
-    ungroup()
-
-  datarange <- Data %>%
-    group_by(aligntrial) %>%
-    reframe(range = range(rel_time)) %>%
-    group_by() %>%
-    summarise(
-      common_min = max(range[c(TRUE, FALSE)]), # max of minimums
-      common_max = min(range[c(FALSE, TRUE)]) # min of maximums
-    )
-  print(paste("common rel_time:", datarange$common_min, datarange$common_max))
-  Data
-}
 
 # data <- load_data_with_brain_alignment(
 #   datapath,
@@ -164,11 +36,11 @@ Align_to_state <- function(Data, Alignment_State) {
 # )
 
 
-data <- load_data(
+data_re <- load_data(
   datapath,
   metapath
 )
-data <- Align_to_state(data, "Sound")
+data_re<- Align_to_state(data_re, "Sound")
 
 data
 
@@ -183,7 +55,9 @@ all_loaded <- map2_dfr(list_of_data, list_of_meta, ~ {
 
 data <- all_loaded %>% mutate(file_id2 = file_id,file_id3 = file_id) %>%  unite('cluster_id',file_id,cluster_id) %>% unite('trial_number',file_id2,trial_number) %>% separate_wider_delim(file_id3, names = c('Animal','condition'),delim ='_')
 
-data
+data = rbind(data_re %>% mutate(cond = 'recall'), data_na %>% mutate(cond='naive')) %>% mutate(cond=) unite('cluster_id',file_id,cluster_id) %>% unite('trial_number',file_id2,trial_number)
+
+data_na %>% filter(!cluster_id %in% data$cluster_id )
 ```
 
 # Trialless
@@ -192,13 +66,13 @@ Trialless <- data  %>%
   # Step 1: Calculate n_trials (same as original)
   left_join(
     data %>%
-      group_by(trial_type) %>%
+      group_by(trial_type,cond) %>%
       summarise(n_trials = n_distinct(trial_number), .groups = "drop"),
-    by = "trial_type"
+    by = join_by("trial_type",'cond')
   ) %>%
   # Step 2: Pre-aggregate event_count by the grouping variables + metadata
   # This replaces the expensive group_by + mutate(sum()) + distinct pattern
-  group_by(trial_type, rel_time, cluster_id, n_trials, depth) %>%
+  group_by(cond,trial_type, rel_time, cluster_id, n_trials, depth) %>%
   summarise(total_event_count = sum(event_count), .groups = "drop") %>%
   # Step 3: Calculate rate (same formula as original)
   mutate(rate = total_event_count / n_trials / 0.01) %>%
@@ -206,21 +80,21 @@ Trialless <- data  %>%
   select(-total_event_count, -n_trials)
 baseline <- Trialless %>%
   filter(between(rel_time, -15, -5)) %>%
-  group_by(cluster_id) %>%
+  group_by(cond,cluster_id) %>%
   summarise(cl_mean = mean(rate), cl_sd = sd(rate))
 Trialless <- Trialless %>%
   left_join(baseline) %>%
-  group_by(cluster_id) %>%
+  group_by(cond,cluster_id) %>%
   mutate(Zscore = (rate - cl_mean) / cl_sd) %>%
   ungroup() %>% replace_na(list(Zscore=0.001))
 
 
 
-g1 <- Trialless %>%
+g1 <- Trialless %>% filter(depth > 1500) %>% 
   filter(between(rel_time, -20, 8)) %>%
-  group_by(rel_time, trial_type) %>%
+  group_by(cond,rel_time, trial_type) %>%
   summarise(Zscore = mean(Zscore)) %>%
-  ungroup() %>% filter(Zscore < Inf) %>%  group_by(trial_type) %>% mutate(Zscore = Zscore - mean(Zscore)) %>% ungroup()
+  ungroup() %>% filter(Zscore < Inf)# %>% # group_by(cond,trial_type) %>% mutate(Zscore = Zscore - mean(Zscore)) %>% ungroup()
 
 asymmetric_smooth <- function(x, window_high = 4, window_low = 25, threshold = 0.25) {
   n <- length(x)
@@ -254,16 +128,17 @@ g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
   geom_line() +
   xlim(-1, 5)
 
-g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
-  geom_smooth(method = "loess", span = 0.1,se=F)+
-  xlim(-0.5, 6)
+g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(cond))) +
+  geom_smooth(method = "loess", span = 0.05,se=F)+
+  xlim(-0.5, 6)+
+  facet_wrap(~trial_type)
   
 
 
 data %>% group_by(trial_type) %>% distinct(state_name)
 
 g1 %>% select(-smoothed1) %>%  pivot_wider(names_from = trial_type,values_from = Zscore) %>% mutate(UP_diff = Upsweep-Opto_Upwsweep, DOWN_diff = Downsweep- Opto_Downsweep) %>% select(rel_time,UP_diff,DOWN_diff) %>% pivot_longer(cols = UP_diff:DOWN_diff, names_to = 'trial_type', values_to = 'diff') %>% ggplot(aes(rel_time,diff,col=trial_type))+
-  geom_smooth(method='loess',span=0.2)+
+  geom_smooth(method='loess',span=0.05)+
   xlim(-0.5,6)
 
 
@@ -271,8 +146,13 @@ Trialless %>% filter(between(rel_time,0,1)) %>%  group_by(depth,trial_type) %>% 
   geom_line()
 
 
+Trialless %>% filter(rel_time==0.01,cluster_id==3)
 
 
+g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(cond))) +
+  geom_smooth(method = "loess", span = 0.1,se=F)+
+  xlim(-4.5,8)+
+  facet_wrap(~trial_type)
 
   
 ```
