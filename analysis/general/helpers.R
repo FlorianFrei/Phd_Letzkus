@@ -42,13 +42,17 @@ load_data_with_brain_alignment <- function(datapath, metapath, depthpath, struct
   data <- fread(datapath) %>%
     filter(cluster_id %in% meta$cluster_id) %>%
     left_join(meta, by = "cluster_id") %>%
-    mutate(state = ifelse(state_name %in% c("Downsweep", "Opto_Upwsweep", "Opto_Downsweep", "Upsweep"), "Sound", state_name)) %>% mutate(trial_type = case_when(
-      trial_type ==1 ~ 'Upsweep',
-      trial_type ==2 ~ 'Downsweep',
-      trial_type ==3 ~ 'Opto_Upwsweep',
-      trial_type ==4 ~ 'Opto_Downsweep',
-    ))
-  
+    mutate(state = ifelse(state_name %in% c("Downsweep", "Opto_Upwsweep", "Opto_Downsweep", "Upsweep"), "Sound", state_name)) %>%mutate(
+  trial_type = as.character(trial_type),
+  trial_type = case_when(
+    trial_type == '1' ~ 'Upsweep',
+    trial_type == '2' ~ 'Downsweep',
+    trial_type == '3' ~ 'Opto_Upwsweep',
+    trial_type == '4' ~ 'Opto_Downsweep',
+    TRUE ~ trial_type  # keep anything else as-is
+  )
+) %>% select(!state_name)
+
   data
 }
 
@@ -70,7 +74,7 @@ load_data <- function(datapath, metapath) {
       trial_type ==2 ~ 'Downsweep',
       trial_type ==3 ~ 'Opto_Upwsweep',
       trial_type ==4 ~ 'Opto_Downsweep',
-    ))
+    )) %>% select(!state_name)
   
   data
 }
@@ -84,6 +88,7 @@ Align_to_state <- function(Data, Alignment_State) {
     mutate(minT = time_bin) %>%
     select(minT, trial_number) %>%
     distinct()
+  Data <-Data %>% left_join(filter2)
   
   nearest_fixed <- function(times, fixed_times) {
     i <- 1
@@ -99,19 +104,33 @@ Align_to_state <- function(Data, Alignment_State) {
     }
     out
   }
-  Data <- Data %>%
-    mutate(
-      nearest_fixed = nearest_fixed(Data$time_bin, filter2$minT),
-      rel_time = round(time_bin - nearest_fixed, 2)
-    )
-  Data <- Data %>%
-    arrange(time_bin) %>%
-    mutate(aligntrial = cumsum(c(TRUE, diff(rel_time) < -1)))
+  Data <- Data %>% 
+  group_by(Animal, condition) %>% 
+  arrange(Animal, condition, time_bin) %>%  # CRITICAL: sort time_bin first
+  mutate(
+    # Get the sorted unique minT values for this Animal/condition
+    nearest_fixed = nearest_fixed(time_bin, sort(unique(minT[!is.na(minT)]))),
+    rel_time = round(time_bin - nearest_fixed, 2)
+  ) %>%
+  ungroup()
   
+  
+ Data <- Data %>%
+  arrange(Animal, condition, time_bin) %>%  # explicit multi-column sort
+  group_by(Animal, condition) %>%
+  mutate(aligntrial = cumsum(c(TRUE, diff(rel_time) < -1))) %>%
+  unite('aligntrial2', aligntrial, Animal, condition, remove = FALSE) %>%
+  select(-aligntrial) %>%
+  rename(aligntrial = aligntrial2)
+
+
+
   Data <- Data %>%
     group_by(aligntrial) %>%
     mutate(trial_type = first(trial_type)) %>%
     ungroup()
+  
+
   
   datarange <- Data %>%
     group_by(aligntrial) %>%
@@ -123,6 +142,23 @@ Align_to_state <- function(Data, Alignment_State) {
     )
   print(paste("common rel_time:", datarange$common_min, datarange$common_max))
   Data
+}
+
+
+safe_load_data <- function(datapath, metapath, depthpath, structure_path) {
+  if (is.na(depthpath) || !file.exists(depthpath)) {
+    message("⚠️ No depth file for: ", basename(datapath))
+    
+    # fallback: use load_data (without depth)
+    data <- load_data(datapath, metapath) %>%
+      mutate(file_id = file_path_sans_ext(basename(datapath)))
+    
+  } else {
+    # use depth-aligned version
+    data <- load_data_with_brain_alignment(datapath, metapath, depthpath, structure_path) %>%
+      mutate(file_id = file_path_sans_ext(basename(datapath)))
+  }
+  data
 }
 
 load_from_list <- function(list_of_data, list_of_meta) {

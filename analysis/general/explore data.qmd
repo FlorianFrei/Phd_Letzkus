@@ -7,15 +7,21 @@ format: html
 
 ```{r}
 library(tidyverse)
+library(tools)
 source("helpers.R")
 
-datapath <- r"(D:\Data\3198-51\3198-51_recall_g0\M3_recall.csv)"
-metapath <- r"(D:\Data\3198-51\3198-51_recall_g0\Meta\cluster_info.tsv)"
 # datapath <- r"(D:\Data\3198-51\3198-51_recall_g0\M3_recall.csv)"
 # metapath <- r"(D:\Data\3198-51\3198-51_recall_g0\Meta\cluster_info.tsv)"
-depthpath <- r"(D:\3556-17\histology\tiffs\slices\iblnaive\channel_locations.json)"
-structure_path <- r"(C:\Users\Freitag\Documents\GitHub\Phd_Letzkus\pre_processing\Allenbrain_structure_tree.csv)"
+# datapath <- r"(D:\Data\3198-51\3198-51_recall_g0\M3_recall.csv)"
+# metapath <- r"(D:\Data\3198-51\3198-51_recall_g0\Meta\cluster_info.tsv)"
+# depthpath <- r"(D:\3556-17\histology\tiffs\slices\iblnaive\channel_locations.json)"
+# structure_path <- r"(C:\Users\Freitag\Documents\GitHub\Phd_Letzkus\pre_processing\Allenbrain_structure_tree.csv)"
 
+
+datapath = "D:/Data/aligned/data"
+metapath = "D:/Data/aligned/meta"
+depthpath = "D:/Data/aligned/depths"
+structure_path <- r"(C:\Users\Freitag\Documents\GitHub\Phd_Letzkus\pre_processing\Allenbrain_structure_tree.csv)"
 
 
 list_of_data <- list.files(path = datapath,
@@ -25,76 +31,92 @@ list_of_data <- list.files(path = datapath,
 list_of_meta <- list.files(path = metapath,
                              pattern = "\\.tsv$",
                              full.names = TRUE)
- 
+
+list_of_depths <- list.files(path = depthpath,
+                             pattern = "\\.json$",
+                             full.names = TRUE)
 
 
-# data <- load_data_with_brain_alignment(
-#   datapath,
-#   metapath,
-#   depthpath,
-#   structure_path
-# )
 
 
-data_re <- load_data(
-  datapath,
-  metapath
+#--- prepare matching table
+data_ids  <- file_path_sans_ext(basename(list_of_data))
+meta_ids  <- file_path_sans_ext(basename(list_of_meta))
+depth_ids <- file_path_sans_ext(basename(list_of_depths))
+
+lookup <- tibble(
+  data = list_of_data,
+  meta = map_chr(data_ids, ~ list_of_meta[match(.x, meta_ids)]),
+  depth = map_chr(data_ids, ~ {
+    matched <- list_of_depths[match(.x, depth_ids)]
+    ifelse(is.na(matched), NA_character_, matched)
+  })
 )
-data_re<- Align_to_state(data_re, "Sound")
-
-data
-
-datapath = "D:/Data/aligned/data"
-metapath = "D:/Data/aligned/meta"
 
 
-all_loaded <- map2_dfr(list_of_data, list_of_meta, ~ {
-  load_data(.x, .y) %>%
-    mutate(file_id = tools::file_path_sans_ext(basename(.x)))
-})
 
-data <- all_loaded %>% mutate(file_id2 = file_id,file_id3 = file_id) %>%  unite('cluster_id',file_id,cluster_id) %>% unite('trial_number',file_id2,trial_number) %>% separate_wider_delim(file_id3, names = c('Animal','condition'),delim ='_')
+data <- pmap_dfr(
+  lookup,
+  \(data, meta, depth)
+    safe_load_data(data, meta, depth, structure_path)
+)
 
-data = rbind(data_re %>% mutate(cond = 'recall'), data_na %>% mutate(cond='naive')) %>% mutate(cond=) unite('cluster_id',file_id,cluster_id) %>% unite('trial_number',file_id2,trial_number)
 
-data_na %>% filter(!cluster_id %in% data$cluster_id )
+
+data <- data %>% mutate(file_id2 = file_id,file_id3 = file_id) %>%  unite('cluster_id',file_id,cluster_id) %>% unite('trial_number',file_id2,trial_number) %>% separate_wider_delim(file_id3, names = c('Animal','condition'),delim ='_')
+
+
+
+data <- Align_to_state(data,'Sound')
+
+
+data %>% write_csv("D:/Data/aligned/wrangled/data.csv")
+
 ```
 
 # Trialless
 ```{r}
-Trialless <- data  %>% 
-  # Step 1: Calculate n_trials (same as original)
+
+
+
+###V1.2
+meta_df <- data %>%
+  select(cluster_id, brain_region:depth, Animal, condition) %>%
+  distinct()
+
+Trialless <- data %>%
+  group_by(trial_type, rel_time, cluster_id) %>%
+  summarise(total_event_count = sum(event_count), .groups = "drop") %>%
+  left_join(meta_df, by = "cluster_id") %>%
   left_join(
     data %>%
-      group_by(trial_type,cond) %>%
+      group_by(Animal, condition, trial_type) %>%
       summarise(n_trials = n_distinct(trial_number), .groups = "drop"),
-    by = join_by("trial_type",'cond')
+    by = c("Animal", "condition", "trial_type")
   ) %>%
-  # Step 2: Pre-aggregate event_count by the grouping variables + metadata
-  # This replaces the expensive group_by + mutate(sum()) + distinct pattern
-  group_by(cond,trial_type, rel_time, cluster_id, n_trials, depth) %>%
-  summarise(total_event_count = sum(event_count), .groups = "drop") %>%
-  # Step 3: Calculate rate (same formula as original)
-  mutate(rate = total_event_count / n_trials / 0.01) %>%
-  # Step 4: Clean up and calculate Z-score
-  select(-total_event_count, -n_trials)
+  mutate(rate = total_event_count / n_trials / 0.01)
 baseline <- Trialless %>%
   filter(between(rel_time, -15, -5)) %>%
-  group_by(cond,cluster_id) %>%
+  group_by(cluster_id) %>%
   summarise(cl_mean = mean(rate), cl_sd = sd(rate))
 Trialless <- Trialless %>%
   left_join(baseline) %>%
-  group_by(cond,cluster_id) %>%
+  group_by(cluster_id) %>%
   mutate(Zscore = (rate - cl_mean) / cl_sd) %>%
   ungroup() %>% replace_na(list(Zscore=0.001))
 
+#Trialless %>% write_csv("D:/Data/aligned/wrangled/trialless.csv")
 
 
-g1 <- Trialless %>% filter(depth > 1500) %>% 
+
+
+
+
+g1 <- Trialless %>% filter(area == 'AUD') %>% 
   filter(between(rel_time, -20, 8)) %>%
-  group_by(cond,rel_time, trial_type) %>%
+  group_by(Animal,condition,rel_time, trial_type) %>%
   summarise(Zscore = mean(Zscore)) %>%
-  ungroup() %>% filter(Zscore < Inf)# %>% # group_by(cond,trial_type) %>% mutate(Zscore = Zscore - mean(Zscore)) %>% ungroup()
+  ungroup() %>% filter(Zscore < Inf) %>%  group_by(Animal,condition,trial_type) %>% mutate(Zscore = Zscore - mean(Zscore)) %>% ungroup()
 
 asymmetric_smooth <- function(x, window_high = 4, window_low = 25, threshold = 0.25) {
   n <- length(x)
@@ -115,27 +137,27 @@ asymmetric_smooth <- function(x, window_high = 4, window_low = 25, threshold = 0
 }
 
 g1 <- g1 %>%
-  group_by(trial_type) %>%
-  mutate(smoothed1 = asymmetric_smooth(Zscore))
+  group_by(Animal,condition,trial_type) %>%
+  mutate(smoothed1 = asymmetric_smooth(Zscore,window_high = 4, window_low = 25, threshold = 0.1))
 
 
 
-g1 %>% ggplot(aes(rel_time, smoothed1, col = as.factor(trial_type))) +
+g1 %>% filter(between(rel_time,-0.5,6)) %>% ggplot(aes(rel_time, smoothed1, col = as.factor(trial_type))) +
   geom_line() +
-  xlim(-2.5, 6)
+facet_grid(Animal~condition)
 
 g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(trial_type))) +
   geom_line() +
   xlim(-1, 5)
 
-g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(cond))) +
+g1  %>% ggplot(aes(rel_time, Zscore,col=trial_type)) +
   geom_smooth(method = "loess", span = 0.05,se=F)+
-  xlim(-0.5, 6)+
-  facet_wrap(~trial_type)
+  xlim(-10.5, -5)+
+  facet_grid(Animal~condition,,scales='free')
   
 
 
-data %>% group_by(trial_type) %>% distinct(state_name)
+  ysdata %>% group_by(trial_type) %>% distinct(state_name)
 
 g1 %>% select(-smoothed1) %>%  pivot_wider(names_from = trial_type,values_from = Zscore) %>% mutate(UP_diff = Upsweep-Opto_Upwsweep, DOWN_diff = Downsweep- Opto_Downsweep) %>% select(rel_time,UP_diff,DOWN_diff) %>% pivot_longer(cols = UP_diff:DOWN_diff, names_to = 'trial_type', values_to = 'diff') %>% ggplot(aes(rel_time,diff,col=trial_type))+
   geom_smooth(method='loess',span=0.05)+
@@ -154,6 +176,16 @@ g1 %>% ggplot(aes(rel_time, Zscore, col = as.factor(cond))) +
   xlim(-4.5,8)+
   facet_wrap(~trial_type)
 
+
+g1  %>% filter(between(rel_time,-0.5,6)) %>%  ggplot(aes(rel_time, Zscore,col=trial_type)) +
+  geom_smooth(method = "loess", span = 0.1,se=F)+
+  facet_grid(Animal~condition,,scales='free')
+
+
+Trialless  %>% filter(between(rel_time,-0.5,6))  %>%   ggplot(aes(rel_time, Zscore,col=trial_type)) +
+  geom_smooth(method = "loess", span = 0.1,se=F)+
+  facet_grid(Animal~condition,,scales='free')
+
   
 ```
 
@@ -171,24 +203,42 @@ ord <- Trialless %>% filter(cluster_id != 90) %>%
   pull(cluster_id)
 
 
-g2 <- Trialless %>%
+g2 <- Trialless %>%  filter(cluster_id != 'M2_naive_90') %>% 
   filter(between(rel_time, -0.5, 6)) %>%
   filter(cluster_id != 90) %>%
   group_by(cluster_id) %>%
   mutate(norm = (Zscore - min(Zscore)) / (max(Zscore) - min(Zscore))) %>%
   ungroup()
-  select(trial_type, cluster_id, Zscore, norm,rel_time, brain_region, area, depth)
+ # select(trial_type, cluster_id, Zscore, norm,rel_time, brain_region, area, depth)
 
 # apply order
 g2$cluster_id <- factor(g2$cluster_id, levels = ord)
 
 
 # heatmap
+# Split data by a grouping variable
+plots <- g2 %>% unite('id',Animal,condition) %>% split(.$id) %>%
+  map(~ ggplot(.x,aes(rel_time, cluster_id, fill = Zscore)) +
+  geom_tile() +
+  geom_vline(xintercept = 0, col = "grey", linetype = "dashed") +
+  scale_fill_gradient2(low = "darkblue", mid = "beige", high = "red", midpoint = 0, limits = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.3)), breaks = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.3)), na.value = "black") +
+  labs(fill = "Z- scored FR") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(-0.5, 6, by = 0.5)) 
+  )
+# Display one of them, e.g. cyl == 6
+plots[["6"]]
+
+
+
+for (p in plots) print(p)
+
+
 g2 %>%
   ggplot(aes(rel_time, cluster_id, fill = Zscore)) +
   geom_tile() +
   geom_vline(xintercept = 0, col = "grey", linetype = "dashed") +
-  scale_fill_gradient2(low = "darkblue", mid = "beige", high = "red", midpoint = 0, limits = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.7)), breaks = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.7)), na.value = "black") +
+  scale_fill_gradient2(low = "darkblue", mid = "beige", high = "red", midpoint = 0, limits = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.3)), breaks = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.3)), na.value = "black") +
   labs(fill = "Z- scored FR") +
   theme_minimal() +
   scale_x_continuous(breaks = seq(-0.5, 6, by = 0.5)) +
@@ -268,13 +318,14 @@ lines <- g2 %>%
 g2 %>%
   ggplot(aes(rel_time, reorder(as.factor(cluster_id), depth), fill = Zscore)) +
   geom_tile() +
-  scale_fill_gradient2(low = "blue", mid = "beige", high = "red", midpoint = , limits = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.8)), breaks = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.8)), na.value = "black") +
+  scale_fill_gradient2(low = "blue", mid = "beige", high = "red", midpoint = , limits = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.2)), breaks = c(round(min(g2$Zscore)), round(max(g2$Zscore) * 0.2)), na.value = "black") +
   labs(fill = "Z- scored FR") +
   theme_minimal() +
   scale_x_continuous(breaks = seq(-0.5, 6, by = 0.5)) +
   theme(axis.text.y = element_blank()) +
   geom_hline(data = lines, aes(yintercept = as.factor(cluster_id))) +
-  geom_text(data = lines, aes(x = -0.7, y = reorder(as.factor(cluster_id), depth), label = brain_region), inherit.aes = F, nudge_y = +1.5)
+  geom_text(data = lines, aes(x = -0.7, y = reorder(as.factor(cluster_id), depth), label = brain_region), inherit.aes = F, nudge_y = +1.5)+
+  theme_void()
 
 
 
@@ -284,7 +335,7 @@ g2 %>%
 
 
 ```{r}
-unitless <- data %>%
+unitless <- al %>%
   # Step 1: Calculate n_trials (same as original)
   left_join(
     data %>%
