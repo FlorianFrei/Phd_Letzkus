@@ -5,78 +5,62 @@ Created on Tue Feb 20 13:24:50 2024
 @author: Florian Freitag
 """
 
-import os
 
-abspath = os.path.abspath(__file__)
-dname = os.path.dirname(abspath)
-os.chdir(dname)
 
+
+import os 
 import numpy as np
 import pandas as pd
-#from Zeta_helper import*
-import itertools
-import matplotlib.pyplot as plt
+from pathlib import Path  
+
 
 import zetapy as zp
 
-#%%
 
-Data = pd.read_csv("E:/Florian_paper/Florian/Aligned_Data/otpo/wrangled_Data/Zetadata.csv")
-
-#%% for single tries
-
-# =============================================================================
-# Data3 = Data.loc[(Data['Day'] == 1) & (Data['Mouse'] == "M7")]
-#  
-# timess = np.asarray(Data3.loc[Data3[Data3.Trialtype=="Airpuff"].groupby('Trial')['time_bin'].idxmin()]['time_bin'])[np.newaxis].T-0.5
-# Spikes = np.asarray(Data3.query('cluster_id==101').loc[:,'time_bin'])[np.newaxis].T
-# zp.zetatest(Spikes, timess,boolPlot=True)
-#  #%% for single triess
-# Data3 = Data.loc[(Data['Day'] == 1) & (Data['Mouse'] == "M7")]
-# Zetatest_unit(Data3.loc[Data3['Behv']=='PC'], 'Airpuff2', 176,window=2,lag=0.1,Plot=True)
-# Zetatest_unit(Data3.loc[Data3['Behv']=='A2L'], 'Airpuff', 176,window=2,lag=0.1,Plot=True)
-# Zetatest_unit(Data3.loc[Data3['Behv']=='W2T'], 'HIT', 176,window=2,lag=0.5,Plot=True)
-# Zetatest_unit(Data3.loc[Data3['Behv']=='W2T'], 'Audio', 176,window=2,lag=0.5,Plot=True)
-# Zetatest_unit(Data3.loc[Data3['Behv']=='W2T'], 'LeftReward', 176,window=2,lag=0.5,Plot=True)
-# =============================================================================
-#     
-# =============================================================================
-#%% Zeta_all
-W2T = ZetaMass(Data,'W2T','HIT',lag = 0.01, window = 0.3)
-A2L = ZetaMass(Data,'A2L','Airpuff',lag=0.01, window = 0.3)
-PC = ZetaMass(Data,'PC','Airpuff2',lag=0.01, window = 0.3)
-Whisk = ZetaMass(Data,'W2T','HIT',lag=0.3, window = 0.3)
-Lick_W2T = ZetaMass(Data,'W2T','LeftReward',lag=0, window = 0.3)
-Lick_A2L = ZetaMass(Data,'A2L','HIT',lag=0.05, window = 0.3)
-
-#%%
-basefolder = "E:/Florian/Aligned_Data/Analysable_data/wrangled_Data/Zetatests"
-W2T.to_csv(basefolder + str('/W2T.csv'))
-A2L.to_csv(basefolder + str('/A2L.csv'))
-PC.to_csv(basefolder + str('/PC.csv'))
-Whisk.to_csv(basefolder + str('/Whisk.csv'))
-Lick_W2T.to_csv(basefolder + str('/lickW2T.csv'))
-Lick_A2L.to_csv(basefolder + str('/lickA2L.csv'))
-
-
-#%% Zeta opto
-pd.unique(Data['Behv'])
-pd.unique(Data['Trialtype'])
-
-Airpuff = ZetaMass(Data,'Airpuff','AirTop_noOpto',lag = 0, window = 0.2)
-Opto = ZetaMass(Data,'just_opto','justOpto',lag = 0, window = 0.2)
-Opto_Air =  ZetaMass(Data,'Opto_Air','AirTop_Opto',lag = 0, window = 0.2)
-
-#%%
-basefolder = "E:/Florian_paper/Florian/Aligned_Data/otpo/wrangled_Data/Zetatests"
-Opto.to_csv(basefolder + str('/Opto.csv'))
-Airpuff.to_csv(basefolder + str('/Airpuff.csv'))
-Opto_Air.to_csv(basefolder + str('/Opto_Air.csv'))
+def Ephys_wrangle(cluster_info,clust,times,sample_freq):
+    #takes raw KS vectos and turns them into a Dataframe  
+    #selects only clusters that have the PHY good 
+    
+    good_cluster = cluster_info.query('bc_unitType == "MUA" |bc_unitType == "GOOD"').loc[:,['cluster_id']]
+    Ephys_raw = pd.DataFrame({'cluster_id': clust, 'times':times}, columns=['cluster_id', 'times'])
+    Ephys_raw = Ephys_raw.assign(seconds = Ephys_raw['times']/sample_freq)
+    Ephys_good = Ephys_raw.merge(good_cluster, on=['cluster_id'],how='inner')
+    return Ephys_good
 
 
 
 #%%
+basefolder ="D:/Data/3198-52/3198-52_recall_g0"
+#%%
 
+mat_name = next(file for file in os.listdir(basefolder) if file.endswith('.mat'))
+
+imec_dir = next(d for d in Path(basefolder).iterdir() if d.is_dir() and d.name.endswith("_imec0"))
+meta_path = str(next(imec_dir.glob("*.ap.meta")))
+
+
+cluster_info = pd.read_csv(basefolder + '/sorted/phy/cluster_info.tsv', sep='\t')
+
+# Load spike data
+clust = np.array(np.load(basefolder + '/sorted/phy/spike_clusters.npy'))
+times = np.array(np.load(basefolder + '/sorted/phy/spike_times.npy'))[:, 0]
+
+
+# Load sound TTL data
+ttlsound = pd.read_csv(basefolder + '/Meta/Audio.csv')
+ttlsound = ttlsound[ttlsound['edge_type']=='rising'].iloc[:,0]
+
+# Get sampling frequency
+sampling_freq = float([line.split('=')[1] for line in open(meta_path) 
+                      if line.startswith('imSampRate=')][0])
+
+
+
+
+
+
+
+Ephys_good = Ephys_wrangle(cluster_info,clust,times,sampling_freq)
 
 
 u_list = []
@@ -87,13 +71,80 @@ for unit in Ephys_good['cluster_id'].unique():
     dblZetaP = zp.zetatest(np.array(Spikes['seconds']), np.array(ttlsound),dblUseMaxDur=5,boolPlot=False,intResampNum = 1000)[0] 
     P_list.append(dblZetaP)
 
-#%%
 
 zeta = pd.DataFrame({'unit':u_list, 'p_val':P_list})
-zeta.to_csv('D:/3556-17/3556-17_naive_g0/Zeta_sound_All.csv',index=False)
+zeta.to_csv(basefolder +str("/Zeta_sound_allUnits.csv"),index=False)
+
+
+#%%
+
+
+# Loop through all nidq.bin files recursively
+for p in Path("D:/Data/raw").rglob("*.nidq.bin"):
+    basefolder = p.parent
+    print(basefolder)
+    
+    
+    output_file = basefolder / "Zeta_sound_allUnits.csv"
+
+    if output_file.exists():
+        print(f"Skipping {basefolder.name}, result already exists.")
+        continue
+
+    print(f"Processing {basefolder} ...")
+
+    try:
+        # Find .mat file
+        mat_name = next(file for file in os.listdir(basefolder) if file.endswith(".mat"))
+
+        # Find _imec0 folder and corresponding .ap.meta file
+        imec_dir = next(d for d in basefolder.iterdir() if d.is_dir() and d.name.endswith("_imec0"))
+        meta_path = str(next(imec_dir.glob("*.ap.meta")))
+
+        # Load sorted spike data
+        cluster_info = pd.read_csv(basefolder / "sorted/phy/cluster_info.tsv", sep="\t")
+        clust = np.array(np.load(basefolder / "sorted/phy/spike_clusters.npy"))
+        times = np.array(np.load(basefolder / "sorted/phy/spike_times.npy"))[:, 0]
+
+        # Load sound TTLs
+        try:
+            ttlsound = pd.read_csv(basefolder / "Meta/Audio.csv")
+            ttlsound = ttlsound[ttlsound["edge_type"] == "rising"].iloc[:, 0]
+        except FileNotFoundError:
+            ttlsound =  pd.read_csv(basefolder / 'Meta/soundttl.csv').iloc[:,0]
+            
+        sampling_freq = float([
+            line.split("=")[1]
+            for line in open(meta_path)
+            if line.startswith("imSampRate=")
+        ][0])
+
+        # Run wrangling and zeta analysis
+        Ephys_good = Ephys_wrangle(cluster_info, clust, times, sampling_freq)
+
+        u_list, P_list = [], []
+        for unit in Ephys_good["cluster_id"].unique():
+            Spikes = Ephys_good[Ephys_good["cluster_id"] == unit]
+            dblZetaP = zp.zetatest(
+                np.array(Spikes["seconds"]),
+                np.array(ttlsound),
+                dblUseMaxDur=5,
+                boolPlot=False,
+                intResampNum=1000
+            )[0]
+            u_list.append(unit)
+            P_list.append(dblZetaP)
+
+        zeta = pd.DataFrame({"unit": u_list, "p_val": P_list})
+        zeta.to_csv(output_file, index=False)
+        print(f"Saved {output_file}")
+
+    except Exception as e:
+        print(f"Error processing {basefolder}: {e}")
+
 
 
 #%%
 #e = zp.zetatest(np.array(Ephys_good[Ephys_good['cluster_id']==130]['seconds']), np.array(ttlsound),dblUseMaxDur=6,boolPlot=True,intResampNum = 1000)
 ul = Ephys_good['cluster_id'].unique()
-e = zp.zetatest(np.array(Ephys_good[Ephys_good['cluster_id']==ul[8]]['seconds']), np.array(ttlsound-1),dblUseMaxDur=7,boolPlot=True,intResampNum = 100)
+e = zp.zetatest(np.array(Ephys_good[Ephys_good['cluster_id']==ul[1]]['seconds']), np.array(ttlsound-1),dblUseMaxDur=7,boolPlot=True,intResampNum = 100)

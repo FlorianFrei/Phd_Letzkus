@@ -221,15 +221,22 @@ def save_outputs_with_blinks(out_folder, data, blinks, bl_starts, bl_stops):
     
     print(f"Outputs saved to: {out_folder}")
 
+
 def choose_roi(video_path):
     """
     Interactive ROI selection for a video.
     """
     cap = cv2.VideoCapture(str(video_path))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Jump to the middle frame
+    middle_frame = total_frames // 2
+    cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame)
+
     ok, frame = cap.read()
     cap.release()
-    if not ok:
-        raise ValueError(f"Could not read {video_path}")
+    if not ok or frame is None:
+        raise ValueError(f"Could not read frame {middle_frame} from {video_path}")
 
     roi = cv2.selectROI(f"ROI for {os.path.basename(video_path)}", frame, showCrosshair=True, fromCenter=False)
     cv2.destroyAllWindows()

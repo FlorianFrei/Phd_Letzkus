@@ -7,10 +7,10 @@ Created on Fri Aug  1 19:00:22 2025
 
 #%%
 import sys
-sys.path.append("C:/Users/Freitag/Desktop/PHD_code/newalignment")
+sys.path.append("C:/Users/Freitag/Documents/GitHub/Phd_Letzkus/pre_processing/align_data")
 from new_helper import process_neural_data_pipeline
-basefolder = "D:/3556-17/3556-17_naive_g0"
-results = process_neural_data_pipeline(basefolder, 'M2_naive.csv',bin_size=0.01)
+basefolder = "D:/Data/raw/7644_recall"
+results = process_neural_data_pipeline(basefolder, '17_naive_allUnits.csv',bin_size=0.01,time_window=None)
 #%%
 
 
@@ -22,13 +22,13 @@ os.chdir(dname)
 
 import numpy as np
 import pandas as pd
-from new_helper import*
-basefolder ="D:/3556-17/3556-17_naive_g0"
+from new_helper import *
+basefolder ="D:/Data/raw/3556-17/17_naive"
 mat_name = next(file for file in os.listdir(basefolder) if file.endswith('.mat'))
 
 last_part = basefolder.split('/')[-1]
 meta_path = f"{basefolder}/{last_part}_imec0/{last_part}_t0.imec0.ap.meta"
-
+meta_path = r"D:\Data\raw\3556-17\17_naive\3556-17_naive_g0_imec0\3556-17_recall_g0_t0.imec0.ap.meta"
 
 #%% load data
 
@@ -38,7 +38,8 @@ clust = np.array (np.load(basefolder + str('/sorted/phy/spike_clusters.npy')))
 times = np.array(np.load(basefolder + str('/sorted/phy/spike_times.npy')))[:,0]
 ITI = pd.read_csv(basefolder + str('/Meta/ttl_edge_times.csv'))
 raw_BPOD = load_mat(basefolder + '/' + mat_name)
-ttlsound =  pd.read_csv(basefolder + str('/Meta/soundttl.csv'))
+ttlsound =  pd.read_csv(basefolder + str('/Meta/soundttl.csv')).iloc[:,0]
+#ttlsound = ttlsound[ttlsound['edge_type']=='rising'].iloc[:,0]
 sampling_freq = float([line.split('=')[1] for line in open(meta_path) if line.startswith('imSampRate=')][0])
 
 
@@ -60,7 +61,7 @@ BPOD =BPOD_wrangle_claude(raw_BPOD, ITI, proceed)
 
 BPOD = add_sound_delays(BPOD, ttlsound)
 
-
+#BPOD.to_csv(basefolder + str('/BPOD.csv') )
 
 #%%
 
@@ -75,10 +76,12 @@ events_with_behv = annotate_spikes_interval_join(Ephys_binned, BPOD,spike_time_c
 #%%
 
 events_with_behv = events_with_behv[['cluster_id','time_bin','event_count','state_name','trial_number','trial_type']]
-events_with_behv.to_csv(basefolder + str('/nobin.csv'))
+events_with_behv.to_csv(basefolder + str('/17_naive_allUnits.csv'))
 
 #events_with_behv = events_with_behv2[['cluster_id','seconds','state_name','trial_number','trial_type']]
 #events_with_behv.to_csv(basefolder + str('/nobin.csv'))
+
+len(events_with_behv['cluster_id'].unique())
 
 #%% plot
 trial_types = (

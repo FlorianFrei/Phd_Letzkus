@@ -20,7 +20,7 @@ import helpers
 
 
 #%% Settings
-VIDEO_FOLDER = r"C:\Users\Freitag\Desktop\videos"
+VIDEO_FOLDER = r"D:\pupiltrack"
 MIN_CERTAINTY = 0.6
 MAKE_LABELED_VIDEO = True
 CONFIG_PATH = r"C:\Users\Freitag\Documents\GitHub\EyeVideoAnalysis\dlc\config.yaml"

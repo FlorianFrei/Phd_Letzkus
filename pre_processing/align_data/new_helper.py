@@ -193,6 +193,8 @@ def BPOD_wrangle_claude(raw_BPOD, ITI, proceed):
         if len(ITI) > len(combined_df):
             print("Trimming ITI to match number of states")
             ITI_trimmed = ITI[:len(combined_df)]
+        elif len(ITI) == len(combined_df):
+            ITI_trimmed = ITI[:len(combined_df)]
         else:
             print("Error: ITI too short for number of states")
             return None
@@ -239,10 +241,10 @@ def add_sound_delays(BPOD, ttlsound):
                 raise ValueError(f"Not enough TTL values for sound state: {row['type']}")
             
             bpod_start = row['continuous_start']
-            actual_sound_time = ttlsound.iloc[ttl_index, 0] if hasattr(ttlsound, 'iloc') else ttlsound[ttl_index]
+            actual_sound_time = ttlsound.iloc[ttl_index] if hasattr(ttlsound, 'iloc') else ttlsound[ttl_index]
             delay_duration = actual_sound_time - bpod_start
             
-            if delay_duration <= 0:
+            if delay_duration <= -0.001:
                 raise ValueError(f"Sound plays before BPOD signal: delay = {delay_duration}")
             
             # Create sound_delay row (insert before the sound)
@@ -273,9 +275,9 @@ def add_sound_delays(BPOD, ttlsound):
 
 def Ephys_wrangle(cluster_info,clust,times,sample_freq):
     #takes raw KS vectos and turns them into a Dataframe  
-    #selects only clusters that have the PHY good or MUA label
+    #selects only clusters that have the PHY good 
     
-    good_cluster = cluster_info.query('group == "good" | group == "mua"').loc[:,['cluster_id']]
+    good_cluster = cluster_info.query('bc_unitType == "MUA" |bc_unitType == "GOOD"').loc[:,['cluster_id']]
     Ephys_raw = pd.DataFrame({'cluster_id': clust, 'times':times}, columns=['cluster_id', 'times'])
     Ephys_raw = Ephys_raw.assign(seconds = Ephys_raw['times']/sample_freq)
     Ephys_good = Ephys_raw.merge(good_cluster, on=['cluster_id'],how='inner')
@@ -333,7 +335,7 @@ def annotate_spikes_interval_join(ephys_df, bpod_df, spike_time_col='seconds',
     return events_with_behv
 
 @timeit
-def process_neural_data_pipeline(basefolder, output_filename='processed_data.csv', bin_size=0.01):
+def process_neural_data_pipeline(basefolder, output_filename='processed_data.csv', bin_size=0.01,time_window=None):
     """
     Complete pipeline to process neural data from raw files to annotated spike data.
     
@@ -348,6 +350,7 @@ def process_neural_data_pipeline(basefolder, output_filename='processed_data.csv
     import os
     import numpy as np
     import pandas as pd
+    from pathlib import Path
     from new_helper import (load_mat, check_state_alignment, BPOD_wrangle_claude, 
                            add_sound_delays, Ephys_wrangle, bin_Ephys, 
                            annotate_spikes_interval_join,timeit)
@@ -358,8 +361,11 @@ def process_neural_data_pipeline(basefolder, output_filename='processed_data.csv
     print("Step 1: Loading file paths...")
     try:
         mat_name = next(file for file in os.listdir(basefolder) if file.endswith('.mat'))
-        last_part = basefolder.split('/')[-1]
-        meta_path = f"{basefolder}/{last_part}_imec0/{last_part}_t0.imec0.ap.meta"
+
+       
+
+        imec_dir = next(d for d in Path(basefolder).iterdir() if d.is_dir() and d.name.endswith("_imec0"))
+        meta_path = str(next(imec_dir.glob("*.ap.meta")))
         print(f"  Found .mat file: {mat_name}")
         print(f"  Meta path: {meta_path}")
     except StopIteration:
@@ -378,7 +384,7 @@ def process_neural_data_pipeline(basefolder, output_filename='processed_data.csv
         print(f"  Loaded spike data: {len(times)} spikes")
         
         # Load ITI data
-        ITI = pd.read_csv(basefolder + '/Meta/ttl_edge_times.csv')
+        ITI = pd.read_csv(basefolder + '/Meta/State_changes.csv')
         print(f"  Loaded ITI data: {len(ITI)} time points")
         
         # Load BPOD data
@@ -386,7 +392,8 @@ def process_neural_data_pipeline(basefolder, output_filename='processed_data.csv
         print(f"  Loaded BPOD data")
         
         # Load sound TTL data
-        ttlsound = pd.read_csv(basefolder + '/Meta/soundttl.csv')
+        ttlsound = pd.read_csv(basefolder + '/Meta/Audio.csv')
+        ttlsound = ttlsound[ttlsound['edge_type']=='rising'].iloc[:,0]
         print(f"  Loaded sound TTL data: {len(ttlsound)} sound events")
         
         # Get sampling frequency
@@ -440,14 +447,25 @@ def process_neural_data_pipeline(basefolder, output_filename='processed_data.csv
     events_with_behv = annotate_spikes_interval_join(Ephys_binned, BPOD, spike_time_col='time_bin')
     print(f"  Spike annotation complete: {len(events_with_behv)} annotated events")
     
-    # Step 10: Save results
+    #step 10: optionally filter time
+    if time_window is not None:
+        min_t, max_t = time_window
+        print(f"Filtering data to time window: {min_t}s – {max_t}s")
+        events_with_behv = events_with_behv[
+            (events_with_behv["time_bin"] >= min_t) &
+            (events_with_behv["time_bin"] <= max_t)
+        ]
+        print(f"  Remaining events after filter: {len(events_with_behv)}")
+    
+    # Step 11: Save results
     print("Step 10: Saving results...")
     events_with_behv = events_with_behv[['cluster_id','time_bin','event_count','state_name','trial_number','trial_type']]
     output_path = basefolder + '/' + output_filename
+    ### ad here
     events_with_behv.to_csv(output_path, index=False)
     print(f"  Results saved to: {output_path}")
     
-    # Step 11: Print summary statistics
+    # Step 12: Print summary statistics
     print("\n" + "="*50)
     print("PROCESSING SUMMARY")
     print("="*50)
