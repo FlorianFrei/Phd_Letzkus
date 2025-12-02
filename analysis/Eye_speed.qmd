@@ -1,0 +1,553 @@
+---
+title: "Eye_analysis"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(furrr)
+library(reticulate)
+
+plan(multisession)
+
+# -------------------------------------------------------
+# 1) LOAD SPEED FILES (original timestamps, no resampling)
+# -------------------------------------------------------
+
+speed_folder <- "D:/Data/speeds/speeds"
+speed_files <- list.files(speed_folder, pattern = "\\.csv$", full.names = TRUE)
+
+load_speed <- function(path) {
+  read_csv(path, show_col_types = FALSE) %>%
+    mutate(
+      sample = sample / 1000,   # convert to seconds
+      source = tools::file_path_sans_ext(basename(path))
+    )
+}
+
+speed_raw <- future_map_dfr(speed_files, load_speed)
+
+
+
+# -------------------------------------------------------
+# 2) LOAD PUPIL DATA (npy)
+# -------------------------------------------------------
+
+np <- import("numpy")
+
+pupil_files <- list.files(
+  "D:/pupiltrack",
+  pattern = "eye.diameter\\.npy$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+pupils <- map_df(pupil_files, ~{
+  df <- np$load(.x)
+  tibble(
+    pupil = as.numeric(df),
+    source = basename(dirname(.x))
+  )
+})
+
+
+# -------------------------------------------------------
+# 3) LOAD CAMERA DELAY (first TTL)
+# -------------------------------------------------------
+
+cam_delay <- read_csv("D:/Data/speeds/first_camttl.csv") %>%
+  select(source = name, start)
+
+
+
+# -------------------------------------------------------
+# 4) ADD FRAME NUMBER + ABSOLUTE TIME TO PUPILS
+# -------------------------------------------------------
+
+pupils <- pupils %>%
+  left_join(cam_delay, by = "source") %>%
+  group_by(source) %>%
+  mutate(
+    frame = row_number(),
+    time = frame / 25 + start      # camera runs at 25 Hz
+  )
+
+
+
+# -------------------------------------------------------
+# 5) INTERPOLATE SPEED ONTO PUPIL TIMEPOINTS
+# -------------------------------------------------------
+
+# one interpolation per source
+interp_speed <- function(df_speed, df_pupil) {
+
+  # create interpolation functions for all numeric speed columns
+  speed_cols <- setdiff(names(df_speed), c("sample", "source"))
+
+  funs <- lapply(speed_cols, function(col)
+    approxfun(df_speed$sample, df_speed[[col]], rule = 2)
+  )
+  names(funs) <- speed_cols
+
+  # apply interpolation
+  for (col in speed_cols) {
+    df_pupil[[col]] <- funs[[col]](df_pupil$time)
+  }
+
+  df_pupil
+}
+#pupils <- pupils %>% filter(source!= "output_trimmed")
+# full alignment
+aligned <- pupils %>%
+  group_by(source) %>%
+  group_modify(~{
+    df_speed  <- speed_raw %>% filter(source == .y$source)
+    interp_speed(df_speed, .x)
+  })
+
+
+
+# -------------------------------------------------------
+# DONE
+# -------------------------------------------------------
+
+# align to sound
+
+# define base folder
+base_dir <- "D:/data/raw"
+
+# find all BPOD.csv files recursively
+files <- list.files(base_dir, pattern = "BPOD\\.csv$", recursive = TRUE, full.names = TRUE)
+
+# read all files and add parent folder name
+data_all <- files %>%
+  map_df(~ {
+    df <- read_csv(.x, show_col_types = FALSE)
+    parent_name <- basename(dirname(.x))
+    df %>% mutate(source = parent_name)
+  })
+
+
+data <- data_all %>%
+    mutate(state = ifelse(state_name %in% c("Downsweep", "Opto_Upwsweep", "Opto_Downsweep", "Upsweep"), "Sound", state_name)) %>%mutate(
+  trial_type = as.character(trial_type),
+  trial_type = case_when(
+    trial_type == '1' ~ 'Upsweep',
+    trial_type == '2' ~ 'Downsweep',
+    trial_type == '3' ~ 'Opto_Upwsweep',
+    trial_type == '4' ~ 'Opto_Downsweep',
+    TRUE ~ trial_type  # keep anything else as-is
+  )
+) %>% select(!state_name) %>% filter(state=='Sound')  %>% mutate(source = case_when(
+  source == '3198-51_g1' ~ '51_naive',
+  source == '3198-51_recall_g0' ~ '51_recall',
+  source == '3198-52_g0' ~ '52_naive',
+  source == '3198-52_recall_g0' ~ '52_recall',
+  .default = source
+  
+))
+
+
+
+
+
+pre <- 5
+post <- 10
+
+sound <- data %>% separate_wider_delim(source, delim="_", names = c('Animal','condition'),cols_remove = F) 
+
+df_segments <- list()
+
+for (s in unique(sound$source)) {
+  message("Processing: ", s)
+  
+  cam_delay_s <- cam_delay %>% filter(source == s)
+  cd <- cam_delay_s %>% pull(start)
+  
+  sound_s <- sound %>% filter(source == s)
+  eye <- aligned %>%
+    filter(source == s) %>%
+    mutate(frame = seq_len(n()),
+           time = (frame / 25) + cd)
+  
+  segments <- vector("list", nrow(sound_s))
+  
+  bin_width <- 1/25
+
+for (i in seq_len(nrow(sound_s))) {
+  t0 <- sound_s$continuous_start[i]
+  trial_type_s <- sound_s$trial_type[i]
+  condition_s  <- sound_s$condition[i]
+
+  segments[[i]] <- eye %>%
+    filter(time >= t0 - pre, time <= t0 + post) %>%
+    mutate(
+      time_relative = time - t0,
+      time_bin = bin_width * floor(time_relative / bin_width),
+      stim_id = trial_type_s,
+      condition = condition_s,
+      source = s
+    )
+}
+  
+  df_segments <- append(df_segments, list(bind_rows(segments)))
+}
+
+df_segments <- bind_rows(df_segments)
+```
+
+
+```{r}
+aligned %>% group_by(source) %>%  mutate(maxP = quantile(aligned$pupil, na.rm=T,0.99), minP = quantile(aligned$pupil, na.rm=T,0.01)) %>% filter(between(pupil,minP,maxP))  %>% filter(time > 10*60) %>% mutate(pz = (pupil - mean(pupil))/sd(pupil)) %>% mutate(speed = abs(speed)) %>%  filter(speed>50) %>% ggplot(aes(speed,pz))+
+  geom_point()+
+  geom_smooth()+
+  facet_wrap(~source,scales ='free')
+
+aligned %>% group_by(source) %>%  mutate(maxP = quantile(aligned$pupil, na.rm=T,0.99), minP = quantile(aligned$pupil, na.rm=T,0.01)) %>% filter(between(pupil,minP,maxP))  %>% filter(time > 10*60) %>%  mutate(maxs = quantile(aligned$speed, na.rm=T,0.99), mins = quantile(aligned$speed, na.rm=T,0.01)) %>% filter(between(speed,mins,maxs)) %>%  mutate(pz = (pupil - mean(pupil))/sd(pupil))   %>% ggplot(aes(speed,pz))+
+  geom_point()+
+  geom_smooth()+
+  facet_wrap(~source,scales ='free')
+ # it seems as if there is a relationship between movement and pupil size, but maybe just because there is movement during the aud stim ?
+aligned %>% group_by(source) %>%  mutate(maxP = quantile(aligned$pupil, na.rm=T,0.99), minP = quantile(aligned$pupil, na.rm=T,0.01)) %>% filter(between(pupil,minP,maxP))  %>% filter(time > 10*60) %>%  mutate(maxs = quantile(aligned$speed, na.rm=T,0.95), mins = quantile(aligned$speed, na.rm=T,0.05)) %>% filter(between(speed,mins,maxs)) %>%  mutate(pz = (pupil - mean(pupil))/sd(pupil)) %>% ungroup() %>% mutate(speed = abs(speed))  %>% ggplot(aes(speed,pz))+
+  geom_point()+
+  geom_smooth()+
+  facet_wrap(~source,scales ='free')
+
+# remake the plot but exclude stim times 
+unused_aligned <- aligned %>%
+  anti_join(df_segments %>% select(source, frame), by = c("source", "frame"))
+
+
+unused_aligned %>% group_by(source) %>%  mutate(maxP = quantile(aligned$pupil, na.rm=T,0.99), minP = quantile(aligned$pupil, na.rm=T,0.01)) %>% filter(between(pupil,minP,maxP))  %>% filter(time > 10*60) %>%  mutate(maxs = quantile(aligned$speed, na.rm=T,0.95), mins = quantile(aligned$speed, na.rm=T,0.05)) %>% filter(between(speed,mins,maxs)) %>%  mutate(pz = (pupil - mean(pupil))/sd(pupil)) %>% ungroup() %>% mutate(speed = abs(speed))  %>% ggplot(aes(speed,pz))+
+  geom_point()+
+  geom_smooth()+
+  facet_wrap(~source,scales ='free')
+
+#still same
+
+```
+
+
+
+
+
+```{r}
+
+
+
+
+
+df_pre = df_segments %>% na.omit() %>% filter(time_relative < -0.1) %>% group_by(source) %>% summarise(mean_pre = mean(pupil), sd_pre =sd(pupil))
+
+df_segments %>% na.omit() %>% left_join(df_pre) %>%  group_by(source) %>% mutate(df = (df - mean_pre) / sd_pre)  %>% group_by(time_relative,source) %>% summarise(df = mean(df)) %>% ggplot(aes(time_relative,df,col=source))+
+  geom_line()+
+  theme_minimal()
+
+df_segments %>% na.omit() %>% left_join(df_pre) %>%  group_by(source) %>% mutate(df = (df - mean_pre) / sd_pre)  %>% group_by(time_relative) %>% summarise(df = mean(df)) %>% ggplot(aes(time_relative,df))+
+  geom_line()
+
+
+
+df_segments %>% na.omit() %>% left_join(df_pre) %>%  group_by(source) %>% mutate(df = (df - mean_pre) / sd_pre)  %>% group_by(time_relative,stim_id) %>% summarise(df = mean(df)) %>% ggplot(aes(time_relative,df,col=stim_id))+
+  geom_line()+
+  theme_minimal()
+
+
+df_segments %>% filter(!stim_id %in% c('Opto_Upwsweep','Opto_Downsweep')) %>% na.omit() %>% left_join(df_pre) %>%  group_by(source) %>% mutate(df = (df - mean_pre) / sd_pre)  %>% group_by(time_relative,condition,stim_id) %>% summarise(df = mean(df)) %>% ggplot(aes(time_relative,df,col=condition))+
+  geom_smooth(span=0.1,se=F)+
+  theme_minimal()+
+  facet_wrap(~stim_id)
+ggsave('D:/figures/Eye_sound_naivrec.svg')
+
+
+###
+
+
+sd <- read_csv("D:/Data/aligned/extra/Shock_direction.csv") %>% mutate(con_direction = ifelse(direction =='Up','Upsweep','Downsweep')) %>% select(Animal = Animal2, con_direction)
+
+df_segments  %>%  filter(!stim_id %in% c('Opto_Upwsweep','Opto_Downsweep')) %>% na.omit() %>% select(!condition)  %>% separate_wider_delim(source, delim="_", names = c('Animal','condition'),cols_remove = F) %>% left_join(sd) %>% mutate(cs = ifelse(stim_id == con_direction,'cs+','cs-')) %>% left_join(df_pre) %>%  group_by(source) %>% mutate(pupil = (df - mean_pre) / sd_pre)  %>% group_by(time_relative,condition,cs) %>% summarise(pupil = mean(pupil)) %>% ggplot(aes(time_relative,pupil,col=cs))+
+  geom_smooth(span=0.1,se=F)+
+  theme_minimal()+
+  facet_wrap(~condition)
+ggsave('D:/figures/Eye_sound_csdir.svg')
+  
+
+
+
+
+
+#####
+
+df_segments %>%  na.omit()  %>% filter(between(time_relative,-.5,5)) %>% left_join(df_pre) %>%  group_by(source) %>% mutate(pupil = (pupil - mean_pre) / sd_pre)  %>% group_by(time_relative) %>% summarise(pupil = mean(pupil)) %>% ggplot(aes(time_relative,pupil))+
+  geom_smooth(span=0.1,se=F,col='black')+
+  geom_line()+
+  geom_line()+
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()
+  xlab('time from sounds onset')+
+  ylab('Zscored Eye diameter')
+ggsave('D:/figures/Eye_sound.svg')
+
+df_segments
+
+
+
+df_segments %>%  na.omit() %>% separate_wider_delim(stim_id,delim='_', names=c('Opto','Stim_dir'), too_few='align_end') %>% replace_na(list(Opto='no'))  %>% filter(between(time_relative,-.5,5.5)) %>% left_join(df_pre) %>%  group_by(source) %>% mutate(pupil = (pupil - mean_pre) / sd_pre)  %>% group_by(time_relative,Opto) %>% summarise(pupil = mean(pupil)) %>% group_by(Opto) %>% mutate(pupil = pupil-mean(pupil)) %>%  ggplot(aes(time_relative,pupil,col=Opto))+
+  geom_smooth(span=0.1,se=F)+
+  geom_line()+
+  geom_line()+
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()
+
+
+df_segments %>%  na.omit()  %>% separate_wider_delim(stim_id,delim='_', names=c('Opto','Stim_dir'), too_few='align_end') %>% replace_na(list(Opto='no'))  %>% filter(between(time_relative,-0.1,0.1)) %>% left_join(df_pre) %>%  group_by(source) %>% mutate(pupil = (pupil - mean_pre) / sd_pre)  %>% group_by(time_relative,Opto,source) %>% summarise(pupil = mean(pupil)) %>% group_by(Opto) %>% mutate(pupil = pupil-mean(pupil)) %>%  ggplot(aes(time_relative,pupil,col=Opto))+
+  geom_smooth(span=0.1,se=F)+
+  geom_line()+
+  geom_line()+
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()+
+  facet_wrap(~source)
+
+df_segments %>%  na.omit()  %>% separate_wider_delim(stim_id,delim='_', names=c('Opto','Stim_dir'), too_few='align_end') %>% replace_na(list(Opto='no'))  %>% filter(between(time_relative,-0.05,0.05))
+
+```
+# look at movement during the auditorystimulus
+```{r}
+# movement seems to be timelocked to the stimulus
+df_segments %>% filter(between(time_relative,-1,6)) %>% na.omit() %>% mutate(time_relative = round(time_relative,2)) %>%  group_by(time_relative) %>% mutate(speed = abs(speed)) %>% summarise(speed = mean(speed)) %>% ggplot(aes(time_relative,speed))+
+  geom_line()+
+  geom_smooth(method='loess',span=0.1,se=F,col='red')+
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()
+
+
+
+
+# plotting per animal, reveals  varying scales of movement speed and stimulus locking 
+df_segments %>% filter(between(time_relative,-1,6)) %>% na.omit() %>% mutate(time_relative = round(time_relative,2)) %>%  group_by(source,time_relative) %>% mutate(speed = abs(speed)) %>% summarise(speed = mean(speed)) %>% ggplot(aes(time_relative,speed))+
+  geom_line()+
+  geom_smooth(method='loess',span=0.1,se=F,col='red')+
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()+
+  facet_wrap(~source,scales ='free')
+
+
+# here i try to normalize movementspeed
+# min-max
+df_segments %>% filter(between(time_relative,-1,6)) %>% na.omit() %>% mutate(time_relative = round(time_relative,2)) %>% mutate(speed = abs(speed))%>% group_by(source) %>% mutate(speed = (speed - min(speed))/( max(speed)-min(speed))) %>% 
+  group_by(time_relative)  %>% summarise(speed = mean(speed)) %>% ggplot(aes(time_relative,speed))+
+  geom_line()+
+  geom_smooth(method='loess',span=0.1,se=F,col='red')+
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()
+
+#Z-score
+df_segments %>% filter(between(time_relative,-1,6)) %>% na.omit() %>% mutate(time_relative = round(time_relative,2)) %>% mutate(speed = abs(speed))%>% group_by(source) %>% mutate(speed = (speed - mean(speed))/(sd(speed))) %>% 
+  group_by(time_relative)  %>% summarise(speed = mean(speed)) %>% ggplot(aes(time_relative,speed))+
+  geom_line()+
+  geom_smooth(method='loess',span=0.1,se=F,col='red')+
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()
+
+
+
+# overall, the pattern is very robust.
+# now i want to look at this as a function of Optop and Trialtype
+df_segments %>% filter(between(time_relative,-1,6)) %>% na.omit() %>% mutate(time_relative = round(time_relative,1)) %>% mutate(speed = abs(speed)) %>%  separate_wider_delim(stim_id,delim='_', names=c('Opto','Stim_dir'), too_few='align_end')   %>% replace_na(list(Opto='no')) %>% mutate(Stim_dir = ifelse(Stim_dir =='Downsweep',Stim_dir,'Upsweep'))  %>% 
+  group_by(Stim_dir,time_relative)  %>% summarise(speed = mean(speed)) %>% group_by(Stim_dir) %>% mutate(speed = speed - mean(speed))%>%  ggplot(aes(time_relative,speed,col=Stim_dir))+
+  geom_line()+
+  geom_smooth(method='loess',span=0.1,se=F)+
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()
+
+
+df_segments %>% filter(between(time_relative,-1,6)) %>% na.omit() %>% mutate(time_relative = round(time_relative,1)) %>% mutate(speed = abs(speed)) %>%  separate_wider_delim(stim_id,delim='_', names=c('Opto','Stim_dir'), too_few='align_end')   %>% replace_na(list(Opto='no')) %>% mutate(Stim_dir = ifelse(Stim_dir =='Downsweep',Stim_dir,'Upsweep'))  %>% 
+  group_by(Opto,time_relative)  %>% summarise(speed = mean(speed)) %>% group_by(Opto) %>% mutate(speed = speed - mean(speed))%>%  ggplot(aes(time_relative,speed,col=Opto))+
+  geom_line()+
+  geom_smooth(method='loess',span=0.1,se=F)+
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()
+
+# how are movementspeed and sound covaring to influence pupil size
+
+stats <- df_segments %>% na.omit() %>%  mutate(speed = abs(speed)) %>%  mutate(pupil = (pupil - mean(pupil))/sd(pupil), speed = (speed-mean(speed))/sd(speed)) %>%  filter(between(time_relative,-1,5)) %>% select(source,pupil,time_bin,stim_id,speed) %>% group_by(source,time_bin) %>% summarise(pupil = mean(pupil), speed = mean(speed))
+
+stats
+ # reminder, both are covarying with time
+stats %>% ggplot(aes(time_bin,pupil))+
+  geom_smooth(method='loess',span=0.1)
+
+stats %>% ggplot(aes(time_bin,speed))+
+  geom_smooth(method='loess',span=0.1)
+
+# is there some negative correlation ?
+stats %>% filter(between(time_bin,0.1,4.5)) %>%   ggplot(aes(speed,pupil))+
+  geom_point()
+
+stats3 <- stats %>% filter(between(time_bin,0.1,4.5))
+cor.test(stats3$pupil,stats3$speed)
+
+# looking at speed categorized faster or slower than median. (similar resluts for lower quantiles)
+df_segments %>% na.omit() %>%  mutate(speed = abs(speed)) %>%  mutate(pupil = (pupil - mean(pupil))/sd(pupil), speed = (speed-mean(speed))/sd(speed)) %>%  filter(between(time_relative,-5,8)) %>% select(source,pupil,time_bin,stim_id,speed) %>% group_by(source) %>%  mutate(speed_cat = ifelse(speed > quantile(speed,0.5),'fast','slow')) %>% group_by(source,time_bin,speed_cat) %>% summarise(pupil = mean(pupil), speed = mean(speed)) %>% ggplot(aes(time_bin,pupil,col=speed_cat))+
+  geom_smooth(method='loess',span=0.1)
+
+# lets quantify the distance between pre sound (-2,-0.1) pupil and post sound (0.1-1)
+stats3 <- df_segments %>% na.omit() %>%  mutate(speed = abs(speed)) %>%  mutate(pupil = (pupil - mean(pupil))/sd(pupil)) %>%  filter(between(time_relative,-5,8)) %>% select(source,pupil,time_bin,stim_id,speed)  %>%  group_by(source) %>%
+  mutate(
+    trial = 1+ cumsum(time_bin < lag(time_bin, default = first(time_bin)))
+  ) %>% unite('trial',trial,source,remove = F) %>% mutate(time_cat = case_when(
+    between(time_bin,-5,-1) ~ 'pre',
+      between(time_bin,1,5) ~ 'post',
+    .default = 'out'))
+ # lots of dissapointment here
+gain <- stats3 %>% filter(time_cat !='out') %>% group_by(time_cat,trial) %>% summarise(pupil = mean(pupil), speed = mean(speed)) %>% pivot_wider(names_from = time_cat,values_from = c(pupil,speed)) %>% mutate(pupil_change = abs(pupil_post - pupil_pre)) %>% mutate(speed_change =speed_post-speed_pre)
+
+gain
+    
+gain %>% ggplot(aes(pupil_change,pupil_pre))+
+  geom_point()
+
+gain %>% ggplot(aes(speed_post,pupil_change))+
+  geom_point()
+gain %>% ggplot(aes(speed_pre,pupil_change))+
+  geom_point()
+gain %>% ggplot(aes(speed_change,pupil_change))+
+  geom_point()
+
+gain %>% ggplot(aes(speed_change,speed_pre))+
+  geom_point()
+
+mod <- lm(data=gain, pupil_change ~ speed_change + speed_post)
+
+summary(mod)
+
+jtools::effect_plot(mod,speed_post)
+```
+
+
+```{r}
+speed_cats <-stats3 %>% group_by(source) %>% mutate(smean = mean(speed)) %>% group_by(trial) %>% mutate(tmean = mean(speed)) %>% mutate(speed_cat = ifelse(tmean < smean,'slow','fast')) %>% select(trial,speed_cat) %>% distinct()
+gain %>% left_join(speed_cats) %>%  na.omit()  %>% ggplot(aes(speed_change,speed_pre,col=speed_cat))+
+  geom_point()+
+  facet_wrap(~speed_cat)
+
+gain %>% left_join(speed_cats) %>%  na.omit() %>% group_by(speed_cat) %>% summarise( mean(pupil_change), mean(speed_change), mean(speed_pre), mean(speed_post))
+
+
+#
+df_segments %>% na.omit() %>%  mutate(speed = abs(speed)) %>%  mutate(pupil = (pupil - mean(pupil))/sd(pupil), speed = (speed-mean(speed))/sd(speed)) %>%  filter(between(time_relative,-5,8)) %>% select(source,pupil,time_bin,stim_id,speed) %>% group_by(source) %>%  mutate(speed_cat = ifelse(speed > quantile(speed,0.5),'fast','slow')) %>% group_by(source,time_bin,speed_cat) %>% summarise(pupil = mean(pupil), speed = mean(speed)) %>% ggplot(aes(time_bin,pupil,col=speed_cat))+
+  geom_smooth(method='loess',span=0.1)
+
+# what if pupil is not influenced by the speed but by the speed compared to the gnereall speed ?
+
+gain %>% left_join(speed_cats) %>%  na.omit() %>% ggplot(aes(speed_cat,pupil_change))+
+  geom_boxplot()+
+  geom_point(aes(speed_cat, mean(pupil_change),col='red'))
+
+
+rejoin <- stats3 %>% filter(time_cat !='out') %>% group_by(source) %>% mutate(ssm = mean(speed)) %>% distinct(source,ssm)
+
+gain2 <- stats3 %>% filter(time_cat !='out')  %>% na.omit() %>%   group_by(time_cat,trial,source) %>% summarise(pupil = mean(pupil), speed = mean(speed)) %>%  left_join(rejoin) %>% mutate(speed_rel = speed-ssm)%>% select(time_cat,speed_rel,trial,pupil) %>%  pivot_wider(names_from = time_cat,values_from = c(pupil,speed_rel)) %>% mutate(pupil_change = abs(pupil_post - pupil_pre)) %>% mutate(speed_change =speed_rel_post-speed_rel_pre)
+
+
+gain2 %>% ggplot(aes(speed_rel_post,pupil_change))+
+  geom_point()
+gain2 %>% ggplot(aes(speed_rel_pre,pupil_change))+
+  geom_point()
+gain2 %>% ggplot(aes(speed_change,pupil_change))+
+  geom_point()
+
+
+# where does the effect go ? WTFFFFFFFFF
+# try to adjust how pre and post are caculated, maybe choise of time windows is weird
+# try plotting this on a single trial basis
+
+
+#######################
+
+df_segments %>% na.omit() %>%  mutate(speed = abs(speed)) %>% group_by(source) %>%   mutate(pupil = (pupil - mean(pupil))/sd(pupil)) %>%  filter(between(time_relative,-5,8)) %>% select(source,pupil,time_bin,stim_id,speed) %>% group_by(source) %>%  mutate(speed_cat = ifelse(speed > quantile(speed,0.5),'fast','slow')) %>% group_by(source,time_bin,speed_cat) %>% summarise(pupil = mean(pupil), speed = mean(speed)) %>% ggplot(aes(time_bin,pupil,col=speed_cat))+
+  geom_smooth(method='loess',span=0.1)+
+  facet_wrap(~speed_cat)
+
+
+stats3 <- df_segments %>% na.omit() %>%  mutate(speed = abs(speed)) %>%  mutate(pupil = (pupil - mean(pupil))/sd(pupil)) %>%  filter(between(time_relative,-5,8)) %>% select(source,pupil,time_bin,stim_id,speed)  %>%  group_by(source) %>%
+  mutate(
+    trial = 1+ cumsum(time_bin < lag(time_bin, default = first(time_bin)))
+  ) %>% unite('trial',trial,source,remove = F) %>% mutate(time_cat = case_when(
+    between(time_bin,-2,-0.2) ~ 'pre',
+      between(time_bin,0.1,1) ~ 'post',
+    .default = 'out'))
+
+
+
+library(dplyr)
+library(data.table)
+
+n <-20
+
+# --- Step 1: Drop NAs and prefilter range (massively reduces data) ---
+df <- df_segments %>% mutate(source='a') %>% 
+  filter(!is.na(speed), !is.na(pupil)) %>%
+  filter(between(time_relative, -3, 8)) %>%
+  mutate(speed = abs(speed)) 
+
+# --- Step 2: Normalize pupil per source efficiently ---
+dt <- as.data.table(df)
+#dt[, pupil := (pupil - mean(pupil)) / sd(pupil), by = source]
+
+# --- Step 3: Compute quantile cutpoints ONLY once per source ---
+quant_tbl <- dt[, .(
+  q = quantile(speed, probs = seq(0,1,length.out = n+1), na.rm = TRUE)
+), by = source]
+
+# build per-source cut functions
+cut_tbl <- quant_tbl[, .(
+  breaks = list(q)
+), by = source]
+
+# join quantile breaks back
+dt <- merge(dt, cut_tbl, by = "source")
+
+# fast quantile-based category
+dt[, speed_cat := cut(speed, breaks[[1]],
+                      include.lowest = TRUE,
+                      labels = paste0( seq_len(n))), 
+   by = source]
+
+# remove temp column
+dt[, breaks := NULL]
+
+# --- Step 4: Create the two summary windows ---
+summary_dt <- dt[
+  (time_bin >= -5 & time_bin <= -1) | 
+  (time_bin >= 1 & time_bin <= 5),
+  .(pupil = mean(pupil)),
+  by = .( speed_cat, window = fifelse(time_bin < 0, "pre", "post"))
+]
+
+summary_dt[, x_pos := ifelse(window == "pre", -1.5, 1.5)]
+
+# --- Step 5: OPTIONAL: Downsample for LOESS ---
+# Keeps smooth but reduces computation dramatically
+dt_smooth <- dt[, .SD[seq(1, .N, by = 5)], by = .(source, speed_cat)]
+
+# --- Step 6: Plot ---
+ggplot() +
+  geom_smooth(data = dt_smooth, aes(time_bin, pupil, col = speed_cat),
+              method = "loess", span = 0.3) +
+  geom_point(data = summary_dt, aes(x_pos, pupil, col = speed_cat), size = 3) +
+  geom_line(data = summary_dt, aes(x_pos, pupil, col = speed_cat))+
+  facet_wrap(~speed_cat,scales='free')
+
+summary_dt %>% select(!x_pos) %>% pivot_wider(names_from = window, values_from = pupil) %>% mutate(change = post-pre) %>% arrange(speed_cat) %>% ggplot(aes(speed_cat,change))+
+  geom_point()
+
+
+gain %>% ggplot(aes(speed_pre,pupil_change))+
+  geom_point()+
+  geom_smooth()+
+  xlim(0,100)
+```
+
+
+```{r}

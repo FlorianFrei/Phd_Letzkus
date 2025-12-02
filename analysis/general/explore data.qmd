@@ -137,6 +137,8 @@ zeta_filter <- Trialless %>%
   select(-p_val) %>% pull(cluster_id)
 
 gc()
+
+Trialless %>% group_by(Animal,condition) %>% distinct(cluster_id) %>% count()
 ```
 
 # Trialless
