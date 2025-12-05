@@ -286,13 +286,13 @@ process_all_data <- function(datapath,
     rm(d); gc()
   })
   
-  # --- recombine all processed chunks
-  message("Combining processed chunks ...")
-  processed_files <- list.files(out_dir, pattern = "_processed\\.csv$", full.names = TRUE)
-  data <- map_dfr(processed_files, read_csv, show_col_types = FALSE)
-  
-  message("✅ Done. Combined data has ", nrow(data), " rows.")
-  return(data)
+  # # --- recombine all processed chunks
+  # message("Combining processed chunks ...")
+  # processed_files <- list.files(out_dir, pattern = "_processed\\.csv$", full.names = TRUE)
+  # data <- map_dfr(processed_files, read_csv, show_col_types = FALSE)
+  # 
+  # message("✅ Done. Combined data has ", nrow(data), " rows.")
+  # return(data)
 }
 
 

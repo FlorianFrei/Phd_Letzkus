@@ -24,7 +24,7 @@ depthpath = "D:/Data/aligned/depths"
 structure_path <- r"(C:\Users\Freitag\Documents\GitHub\Phd_Letzkus\pre_processing\Allenbrain_structure_tree.csv)"
 
 
-data <- process_all_data(
+process_all_data(
   datapath, 
   metapath,  
   depthpath,
@@ -37,7 +37,7 @@ data <- process_all_data(
 
 
 
-data %>% write_csv("D:/Data/aligned/wrangled/data.csv")
+#data %>% write_csv("D:/Data/aligned/wrangled/data.csv")
 
 
 library(data.table)
@@ -84,14 +84,14 @@ for (f in files) {
 
 
 # combine into one data.table
-all_data <- rbindlist(all_data, fill = TRUE)
+#all_data <- rbindlist(all_data, fill = TRUE)
 
-old <-  read.csv(file="D:/Data/aligned/wrangled/data_allUnits.csv",nrows=20)
-new <-  read.csv(file="D:/Data/aligned/wrangled/data.csv",nrows=20)
+#old <-  read.csv(file="D:/Data/aligned/wrangled/data_allUnits.csv",nrows=20)
+#new <-  read.csv(file="D:/Data/aligned/wrangled/data.csv",nrows=20)
 
 ### Trialless
 
-gc()
+#gc()
 #
 #Trialless <- align_trials(all_data)
 Trialless <- align_trials_multiple_files( "D:/Data/aligned/wrangled/chunks")
@@ -105,7 +105,7 @@ Trialless <- Trialless %>% left_join(shock)
 
 
 
-Trialless %>% write_csv("D:/Data/aligned/wrangled/Trialless_allUnits2.csv")
+Trialless %>% write_csv("D:/Data/aligned/wrangled/Trialless_allUnits3.csv")
 
 
 

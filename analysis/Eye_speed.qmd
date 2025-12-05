@@ -194,6 +194,8 @@ for (i in seq_len(nrow(sound_s))) {
 }
 
 df_segments <- bind_rows(df_segments)
+
+write_csv(df_segments)
 ```
 
 
