@@ -47,7 +47,7 @@ load_data_with_brain_alignment <- function(datapath, metapath, depthpath, struct
   trial_type = case_when(
     trial_type == '1' ~ 'Upsweep',
     trial_type == '2' ~ 'Downsweep',
-    trial_type == '3' ~ 'Opto_Upwsweep',
+    trial_type == '3' ~ 'Opto_Upsweep',
     trial_type == '4' ~ 'Opto_Downsweep',
     TRUE ~ trial_type  # keep anything else as-is
   )

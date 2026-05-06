@@ -1,0 +1,334 @@
+---
+title: "bintry"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+binfree1 <- read_csv("I:/Data/raw/8272/8272_naive/noBin.csv") %>% mutate(Animal = 72, condition ="naive")
+binfree2 <- read_csv("I:/Data/raw/8273/8273_naive/noBin.csv") %>% mutate(Animal = 73, condition ="naive")
+binfree3  <- read_csv("I:/Data/raw/8251/8251_naive/noBin.csv") %>% mutate(Animal = 51, condition= "recall")
+
+binfree <- rbind(binfree1,binfree2,binfree3)
+#bined <- read_csv("I:/Data/raw/8272/8272_naive/bined.csv")
+
+```
+#add meta
+```{r}
+minT <- binfree %>% filter(state_name %in% c('Downsweep',"Upsweep","Opto_Upwsweep","Opto_Downsweep")) %>% group_by(Animal,condition,trial_number) %>% summarise(minT = min(seconds))
+
+binfree <- binfree %>%
+  left_join(minT) %>%
+  mutate(rel_time = seconds - minT) %>%
+  mutate(trial_type = case_when(
+    trial_type == 1 ~ "Upsweep",
+    trial_type == 2 ~ "Downsweep",
+    trial_type == 3 ~ "Opto_Upwsweep",
+    trial_type == 4 ~ "Opto_Downsweep",
+    TRUE ~ NA_character_
+  ))
+                     
+                     
+```
+
+#realign time
+```{r}
+
+
+
+library(data.table)
+setDT(binfree)
+
+# 1. Get unique event times (anchors) PER Animal and condition
+# This ensures we don't align Animal 1 to Animal 2's events.
+anchor_dt <- binfree[!is.na(minT), .(anchor = unique(minT)), by = .(Animal, condition)]
+
+# Set the key to include the grouping variables + the time variable
+setkey(anchor_dt, Animal, condition, anchor)
+
+# 2. Perform the rolling join with grouping constraints
+# We add Animal and condition to the 'on' statement.
+binfree[, nearest_fixed := anchor_dt[binfree, 
+                                     on = .(Animal, condition, anchor = seconds), 
+                                     roll = "nearest", 
+                                     x.anchor]]
+
+# 3. Compute relative time
+binfree[, rel_time := seconds - nearest_fixed]
+
+# 4. Rebuild trial structure
+setorder(binfree, Animal, condition, seconds)
+binfree[, aligntrial := cumsum(c(TRUE, diff(rel_time) < -1)), by = .(Animal, condition)]
+binfree[, aligntrial2 := paste(aligntrial, Animal, condition, sep = "_")]
+baseline_stats <- binfree[rel_time >= -35 & rel_time < -5, .(
+  # Calculate firing rate for this specific trial in the baseline window
+  trial_rate = .N / 30 
+), by = .(cluster_id, trial_number)][, .(
+  base_mean = mean(trial_rate), 
+  base_sd = sd(trial_rate)
+), by = cluster_id]
+
+binfree <- as_tibble(binfree) %>% select(cluster_id,state_name,trial_type,seconds,rel_time,Animal,condition,trial_number = aligntrial)
+
+
+binfree %>% ggplot(aes(rel_time))+
+  geom_histogram()+
+  facet_wrap(~as.factor(Animal))
+
+```
+
+
+#calculate baseline
+```{r}
+
+library(data.table)
+
+# --- baseline only version (same logic as your function) ---
+
+df <- as.data.table(binfree)[rel_time >= -35 & rel_time < -5]
+
+# time range
+curr_range <- range(df$rel_time, na.rm = TRUE)
+
+# binning
+bin_width <- 1
+breaks <- seq(curr_range[1], curr_range[2], by = bin_width)
+centers <- breaks[-length(breaks)] + (bin_width / 2)
+num_bins <- length(centers)
+
+df[, bin_idx := findInterval(rel_time, breaks)]
+df_in <- df[bin_idx > 0 & bin_idx <= num_bins]
+
+# counts (same grouping as original)
+counts <- df_in[, .(event_count = .N),
+                by = .(cluster_id, trial_number, trial_type, bin_idx)]
+
+# full grid (CRITICAL: keeps zero bins)
+full_grid <- CJ(
+  cluster_id   = unique(df$cluster_id),
+  trial_number = unique(df$trial_number),
+  trial_type   = unique(df$trial_type),
+  bin_idx      = seq_len(num_bins)
+)
+
+res <- counts[full_grid, on = .(cluster_id, trial_number, trial_type, bin_idx)]
+res[is.na(event_count), event_count := 0]
+
+# rate
+res[, `:=`(
+  rel_time = centers[bin_idx],
+  rate     = event_count / bin_width
+)]
+
+# SAME as your function: average across trials first
+baseline_binned <- res[, .(rate = mean(rate)),
+                       by = .(cluster_id, trial_number, trial_type, bin_idx, rel_time)]
+
+# final baseline stats
+baseline_stats <- baseline_binned[, .(
+  base_mean = mean(rate),
+  base_sd   = sd(rate)
+), by = cluster_id]
+
+baseline_stats
+
+
+
+
+
+library(data.table)
+
+df_all <- as.data.table(binfree)
+
+baseline_stats_list <- df_all[, {
+
+  df <- .SD[rel_time >= -35 & rel_time < -5]
+
+  # time range (per session)
+  curr_range <- range(df$rel_time, na.rm = TRUE)
+
+  bin_width <- 1
+  breaks <- seq(curr_range[1], curr_range[2], by = bin_width)
+  centers <- breaks[-length(breaks)] + (bin_width / 2)
+  num_bins <- length(centers)
+
+  df[, bin_idx := findInterval(rel_time, breaks)]
+  df_in <- df[bin_idx > 0 & bin_idx <= num_bins]
+
+  # counts
+  counts <- df_in[, .(
+    event_count = .N
+  ), by = .(cluster_id, trial_number, trial_type, bin_idx)]
+
+  # full grid (session-local!)
+  full_grid <- CJ(
+    cluster_id   = unique(df$cluster_id),
+    trial_number = unique(df$trial_number),
+    trial_type   = unique(df$trial_type),
+    bin_idx      = seq_len(num_bins)
+  )
+
+  res <- counts[full_grid,
+                on = .(cluster_id, trial_number, trial_type, bin_idx)]
+
+  res[is.na(event_count), event_count := 0]
+
+  res[, `:=`(
+    rel_time = centers[bin_idx],
+    rate     = event_count / bin_width
+  )]
+
+  baseline_binned <- res[, .(
+    rate = mean(rate)
+  ), by = .(cluster_id, trial_number, trial_type, bin_idx, rel_time)]
+
+  baseline_binned[, .(
+    base_mean = mean(rate),
+    base_sd   = sd(rate)
+  ), by = cluster_id]
+
+}, by = .(Animal, condition)]
+
+
+```
+
+
+
+
+```{r}
+library(data.table)
+library(dplyr)
+
+bin_events_dt_final <- function(dt, bin_width, groups = c("cluster_id", "trial_number", "trial_type"), bin_range = NULL, 
+                                Zscore = FALSE, baseline_df = NULL, smooth_sd = NULL) {
+  
+  # --- YOUR CLEAN CORE ---
+  df <- as.data.table(dt)
+  if (is.null(bin_range)) bin_range <- range(df$rel_time, na.rm = TRUE)
+  
+  breaks <- seq(bin_range[1], bin_range[2], by = bin_width)
+  centers <- breaks[-length(breaks)] + (bin_width / 2)
+  num_bins <- length(centers)
+  df[, bin_idx := findInterval(rel_time, breaks)]
+  df_in <- df[bin_idx > 0 & bin_idx <= num_bins]
+  
+  counts <- df_in[, .(event_count = .N), by = c(groups, "bin_idx")]
+  
+  grid_list <- c(lapply(groups, function(x) unique(df[[x]])), list(bin_idx = seq_len(num_bins)))
+  full_grid <- do.call(CJ, grid_list)
+  setnames(full_grid, c(groups, "bin_idx"))
+  
+  res <- counts[full_grid, on = c(groups, "bin_idx")]
+  res[is.na(event_count), event_count := 0]
+  
+  # --- ADDED NORMALIZATION ---
+  # If trial_number is missing, we must divide by N trials to get a true mean rate
+ if (!"trial_number" %in% groups) {
+  norm_groups <- setdiff(groups, "cluster_id")
+  
+  if (length(norm_groups) == 0) {
+    trial_counts <- df[, .(n_trials = uniqueN(trial_number)), by = cluster_id]
+    res <- trial_counts[res, on = "cluster_id"]
+  } else {
+    trial_counts <- df[, .(n_trials = uniqueN(trial_number)), 
+                       by = c("cluster_id", norm_groups)]
+    res <- trial_counts[res, on = c("cluster_id", norm_groups)]
+  }
+  
+  res[, rate := event_count  / bin_width/ n_trials]
+} else {
+  res[, rate := event_count / bin_width]
+}
+  
+  res[, rel_time := centers[bin_idx]]
+  
+   # 4. Gaussian Smoothing
+  if (!is.null(smooth_sd) && smooth_sd > 0) {
+    # Convert smooth_sd (seconds) to number of bins
+    sigma_bins <- smooth_sd / bin_width
+    
+    # Create Gaussian Kernel (spanning +/- 4 SDs for accuracy)
+    # k_idx is the distance from the center in bins
+    half_width <- ceiling(4 * sigma_bins)
+    k_idx <- seq(-half_width, half_width)
+    kernel <- exp(-(k_idx^2) / (2 * sigma_bins^2))
+    kernel <- kernel / sum(kernel) # Normalize so total area = 1
+    
+    # Apply Convolution per trial
+    # sides = 2 ensures the filter is centered
+    
+    
+    smooth_groups <- intersect(c("cluster_id", "trial_number"), names(res))
+
+res[, rate := as.numeric(stats::filter(rate, kernel, sides = 2)), 
+    by = smooth_groups]
+    
+    # Handle the NAs at edges created by stats::filter
+    res[is.na(rate), rate := 0] 
+  }
+  
+  # --- UPDATED Z-SCORE SECTION ---
+  # --- ROBUST Z-SCORE SECTION ---
+  if (Zscore) {
+    if (!is.null(baseline_df)) {
+      # Use merge() instead of the index join []
+      # all.x = TRUE ensures we keep all bins even if baseline is missing
+      res <- merge(res, baseline_df, by = "cluster_id", all.x = TRUE)
+      
+      # Now calculate
+      res[, z_rate := (rate - base_mean) / (base_sd + 1e-9)]
+      
+      # Cleanup
+      res[, c("base_mean", "base_sd") := NULL]
+    } else {
+      # Internal fallback
+      res[, z_rate := (rate - mean(rate, na.rm = TRUE)) / (sd(rate, na.rm = TRUE) + 1e-9), by = cluster_id]
+    }
+  }
+  
+  return(as_tibble(res[, bin_idx := NULL]))
+}
+
+
+
+
+res2 <- binfree %>% filter(between(rel_time,-0.1,1)) %>% bin_events_dt_final(0.01,Zscore = T,baseline_df = baseline_stats,smooth_sd=0,groups = c("cluster_id"))
+res2 %>% group_by(rel_time) %>% summarise(mz = mean(z_rate)) %>% ggplot(aes(rel_time,mz))+
+  geom_line()
+
+res2 <- full2 %>% filter(between(rel_time,-0.1,1)) %>% bin_events_dt_final(0.01,Zscore = T,baseline_df = baseline_stats,smooth_sd=0,groups = c("cluster_id", "trial_number", "trial_type"))
+res2 %>% group_by(rel_time) %>% summarise(mz = mean(z_rate)) %>% ggplot(aes(rel_time,mz))+
+  geom_line()
+```
+
+
+
+
+```{r}
+
+# 2. Main workflow using nest()
+res2 <- binfree %>%
+  filter(between(rel_time, -0.1, 1)) %>%
+  group_by(Animal, condition) %>%
+  nest() %>%
+  mutate(processed = map(data, ~bin_events_dt_final(
+    .x, 
+    bin_width = 0.01, 
+    groups = c("cluster_id", "trial_number", "trial_type"),
+    Zscore = TRUE, 
+    baseline_df = baseline_stats_list, # Ensure this handles session-specific indexing
+    smooth_sd = 0
+  ))) %>%
+  unnest(processed)
+
+
+
+
+```
+
+```{r}
+
+binfree %>% filter(Animal == 51 & condition == "recall")  )
+```
+

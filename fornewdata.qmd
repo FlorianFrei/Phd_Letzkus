@@ -1,0 +1,544 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(data.table)
+```
+
+```{r}
+
+
+safe_load_all_data <- function(datapath) {
+  library(data.table)
+  library(dplyr)
+  library(tools)
+  
+  data <- fread(datapath) %>%
+    mutate(
+      # --- collapse states (same logic as before)
+      state = ifelse(state_name %in% c("Downsweep", "Opto_Upwsweep","Opto_Upsweep", "Opto_Downsweep", "Upsweep"),
+                     "Sound", state_name),
+      
+      # --- recode trial_type (same as before)
+      trial_type = case_when(
+        trial_type == 1 ~ "Upsweep",
+        trial_type == 2 ~ "Downsweep",
+        trial_type == 3 ~ "Opto_Upsweep",
+        trial_type == 4 ~ "Opto_Downsweep",
+        TRUE ~ as.character(trial_type)
+      ),
+      
+      # --- add file id (same as safe_load_data)
+      file_id = file_path_sans_ext(basename(datapath))
+    ) %>%
+    select(-state_name)
+  
+  return(data)
+}
+
+process_all_data <- function(datapath,
+                             Alignment_State,
+                             out_dir = NULL) {
+  
+  library(tidyverse)
+  library(data.table)
+  library(tools)
+  
+  # --- determine output directory
+  if (is.null(out_dir)) {
+    out_dir <- file.path(datapath, "processed_chunks")
+  }
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # --- list input files (ONLY data now)
+  list_of_data <- list.files(datapath, pattern = "\\.csv$", full.names = TRUE)
+  
+  # --- Align_to_state (unchanged)
+  Align_to_state <- function(Data, Alignment_State) {
+    
+    filter2 <- Data %>%
+      group_by(trial_number) %>%
+      filter(state == Alignment_State) %>%
+      slice_min(time_bin) %>%
+      mutate(minT = time_bin) %>%
+      select(minT, trial_number) %>%
+      distinct()
+    
+    Data <- Data %>% left_join(filter2, by = "trial_number")
+    
+    nearest_fixed <- function(times, fixed_times) {
+  fixed_times <- sort(unique(fixed_times[!is.na(fixed_times)]))
+  if (length(fixed_times) == 0) return(rep(NA, length(times)))
+  
+  # Find indices of nearest values
+  idx <- findInterval(times, fixed_times, all.inside = TRUE)
+  # Compare distance to left and right neighbor to find the absolute nearest
+  dist_left <- abs(times - fixed_times[idx])
+  dist_right <- abs(times - fixed_times[pmin(idx + 1, length(fixed_times))])
+  
+  return(ifelse(dist_left < dist_right, fixed_times[idx], fixed_times[pmin(idx + 1, length(fixed_times))]))
+}
+    
+    Data <- Data %>%
+      group_by(Animal, condition) %>%
+      arrange(Animal, condition, time_bin) %>%
+      mutate(
+        nearest_fixed = nearest_fixed(time_bin, sort(unique(minT[!is.na(minT)]))),
+        rel_time = round(time_bin - nearest_fixed, 2)
+      ) %>%
+      ungroup() %>%
+      arrange(Animal, condition, time_bin) %>%
+      group_by(Animal, condition) %>%
+      mutate(aligntrial = cumsum(c(TRUE, diff(rel_time) < -1))) %>%
+      unite('aligntrial2', aligntrial, Animal, condition, remove = FALSE) %>%
+      select(-aligntrial) %>%
+      rename(aligntrial = aligntrial2) %>%
+      group_by(aligntrial) %>%
+      mutate(trial_type = first(trial_type)) %>%
+      ungroup()
+    
+    datarange <- Data %>%
+      group_by(aligntrial) %>%
+      reframe(range = range(rel_time)) %>%
+      summarise(
+        common_min = max(range[c(TRUE, FALSE)]),
+        common_max = min(range[c(FALSE, TRUE)])
+      )
+    
+    message("common rel_time: ", datarange$common_min, " to ", datarange$common_max)
+    
+    Data
+  }
+  
+  # --- process each dataset
+  walk2(list_of_data, seq_along(list_of_data), \(data_file, i) {
+    
+    message("Processing file ", i, "/", length(list_of_data), ": ", basename(data_file))
+    
+    # --- load (NEW: no meta, no depth)
+    d <- safe_load_all_data(data_file)
+    
+    # --- tidy postprocessing (unchanged)
+    d <- d %>%
+      mutate(file_id2 = file_id,
+             file_id3 = file_id) %>%
+      unite('cluster_id', file_id, cluster_id, remove = FALSE) %>%
+      unite('trial_number', file_id2, trial_number, remove = FALSE) %>%
+      separate_wider_delim(file_id3, names = c('Animal', 'condition'), delim = '_')
+    
+    # --- align
+    d <- Align_to_state(d, Alignment_State = Alignment_State)
+    d %>% select(cluster_id:state,aligntrial,Animal,condition,rel_time)
+    # --- save
+    out_file <- file.path(out_dir, paste0(basename(data_file), "_processed.csv"))
+    readr::write_csv(d, out_file)
+    
+    message("✅ Saved: ", basename(out_file), " (", nrow(d), " rows)")
+    
+    rm(d); gc()
+  })
+}
+  
+```
+
+```{r}
+process_all_data("H:/Data/aligned/new/data", "Sound",
+                             out_dir = "H:/Data/aligned/new/aligned")
+```
+
+```{r}
+align_trials_multiple_files <- function(folder_path, baseline_corr = TRUE) {
+  
+  # Get the list of all files in the folder
+  file_list <- list.files(folder_path, full.names = TRUE)
+  
+  # Initialize an empty list to store results
+  all_results <- list()
+
+  # Process each file in the folder
+  for (file in file_list) {
+    # Read the file (assuming CSV format; change as needed)
+    data <- read.csv(file)
+    
+    # Metadata selection
+    meta_df <- data %>%
+      select(cluster_id, Animal, condition) %>%
+      distinct()
+
+    # Compute trialless data
+    Trialless <- data %>%
+      group_by(trial_type, rel_time, cluster_id) %>%
+      summarise(total_event_count = sum(event_count), .groups = "drop") %>%
+      left_join(meta_df) %>%
+      left_join(
+        data %>%
+          group_by(Animal, condition, trial_type) %>%
+          summarise(n_trials = n_distinct(trial_number), .groups = "drop"),
+        by = c("Animal", "condition", "trial_type")
+      ) %>%
+      mutate(rate = total_event_count / n_trials / 0.01)
+    
+    # Baseline correction if enabled
+    if (baseline_corr) {
+      baseline <- Trialless %>%
+        filter(between(rel_time, -15, -5)) %>%
+        group_by(cluster_id) %>%
+        summarise(cl_mean = mean(rate,na.rm=T), cl_sd = sd(rate,na.rm = T))
+      
+      Trialless <- Trialless %>%
+        left_join(baseline) %>%
+        group_by(cluster_id) %>%
+        mutate(Zscore = (rate - cl_mean) / cl_sd) %>%
+        ungroup() 
+    }
+
+    # Append the processed file's result to the list
+    message("processed" ,file)
+    all_results[[file]] <- Trialless
+  }
+
+  # Combine all the results into one data frame
+  combined_results <- bind_rows(all_results)
+
+  return(combined_results)
+}
+
+
+library(data.table)
+
+align_trials_multiple_files_dt <- function(folder_path, baseline_corr = TRUE) {
+  
+  file_list <- list.files(folder_path, full.names = TRUE)
+  
+  process_file <- function(file) {
+    dt <- fread(file)
+    
+    # Ensure data.table
+    setDT(dt)
+    
+    # Compute Trialless in one pass
+    Trialless <- dt[
+      , .(
+        total_event_count = sum(event_count),
+        n_trials = uniqueN(trial_number)
+      ),
+      by = .(cluster_id, Animal, condition, trial_type, rel_time)
+    ]
+    
+    # Compute rate
+    Trialless[
+      , rate := total_event_count / n_trials / 0.01
+    ]
+    
+    # Baseline correction
+    if (baseline_corr) {
+      
+      baseline <- Trialless[
+        rel_time >= -15 & rel_time <= -5,
+        .(
+          cl_mean = mean(rate, na.rm = TRUE),
+          cl_sd   = sd(rate, na.rm = TRUE)
+        ),
+        by = cluster_id
+      ]
+      
+      # Join + compute Z in-place (no copies)
+      Trialless[baseline, `:=`(
+        cl_mean = i.cl_mean,
+        cl_sd   = i.cl_sd
+      ), on = "cluster_id"]
+      
+      Trialless[
+        , Zscore := (rate - cl_mean) / cl_sd
+      ]
+    }
+    
+    Trialless[]
+  }
+  
+  # Process all files (sequential but fast)
+   result <- rbindlist(lapply(file_list, process_file), use.names = TRUE)
+ 
+  
+  return(result)
+}
+
+```
+
+```{r}
+Trialless <- align_trials_multiple_files("I:/Data/aligned/new/aligned", baseline_corr = TRUE)
+#Trialless2 <- align_trials_multiple_files_dt("I:/Data/aligned/new/aligned", baseline_corr = TRUE)
+
+shock <- read_csv(r"(I:\Data\aligned\extra\Shock_direction.csv)") %>% select(Animal = Animal2, direction)
+
+Trialless <- Trialless %>% left_join(shock)
+
+
+qm_list = list.files("I:/Data/aligned/new/extra/metrics", full.names = T)
+library(readr)
+library(purrr)
+
+
+# get all csv files
+files <- qm_list
+
+# function to read and process one file
+read_one <- function(file) {
+  df <- read_csv(file, show_col_types = FALSE)
+  
+  df %>%
+    # rename first column (often "Unnamed: 0" or similar)
+    rename(cluster_id = 1) %>%
+    # keep only relevant columns
+    select(cluster_id, num_spikes, presence_ratio) %>%
+    # add filename as ID
+    mutate(ID =tools::file_path_sans_ext(basename(file)))
+}
+
+# apply to all files and bind
+qm <- map_dfr(files, read_one)
+
+# result
+qm <- qm %>% filter(presence_ratio > 0.8) %>% arrange(num_spikes) %>% unite('cluster_id',ID,cluster_id )
+
+Trialless = Trialless %>% filter(cluster_id %in% qm$cluster_id)
+
+Trialless %>% write_csv("I:/Data/aligned/new/wrangled/Trialless_allUnits.csv")
+
+Trialless %>% filter(Animal == '8186')  %>%  filter(between(rel_time, -15, -5)) %>%
+        group_by(cluster_id) %>%
+        summarise(cl_mean = mean(rate,na.rm=T), cl_sd = sd(rate,na.rm = T))
+
+
+pclust <- Trialless %>%
+  group_by(cluster_id) %>%
+  summarise(
+    n_baseline = sum(between(rel_time, -55, -5))
+  ) %>%
+  filter(n_baseline == 0) %>% select(cluster_id)
+
+qm %>% filter(cluster_id %in% pclust$cluster_id)
+
+Trialless %>% filter(Animal == "8186" & condition == 'naive') %>% filter(!cluster_id %in% pclust$cluster_id) %>% ggplot(aes(rel_time,total_event_count))+
+  geom_line()+
+  facet_wrap(~cluster_id)
+
+```
+
+```{r}
+
+Trialless %>% filter(between(rel_time,-1,7)) %>% mutate(Opto = ifelse(trial_type %in% c('Downsweep','Upsweeep'),'no','opto')) %>%   unite('ID',Animal,condition)  %>% group_by(ID,rel_time,Opto) %>% summarise(Zscore = mean(rate,na.rm=T)) %>%  ggplot(aes(rel_time,Zscore,col=Opto))+
+  geom_line()+
+  geom_smooth(span=0.1)+
+  facet_wrap(~ID,scales ='free_y')
+
+
+
+
+```
+
+```{r}
+
+Trialless %>%  filter(between(rel_time,0,0.03)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore ))  %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type,Animal,condition) %>% summarise(Zscore = mean(Zscore))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_line()+
+  facet_wrap(condition~Animal, scales = "free")
+
+
+
+```
+
+```{r}
+library(tidyverse)
+
+# Get files, read them, and use filenames as IDs in one pipe
+depths <- list.files("H:/Data/aligned/new/extra/extrenum_channels", "*.csv", full.names = TRUE) %>%
+  set_names(basename(.) %>% str_remove(".csv")) %>%
+  map_dfr(read_csv, .id = "source_file")
+
+Trialless %>%  filter(between(rel_time,-0.12,0)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 1000)  %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type,Animal,condition) %>% summarise(Zscore = mean(Zscore))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_smooth(se=F,span=0.5)+
+  facet_wrap(condition~Animal, scales = "free")
+
+
+Trialless %>%  filter(between(rel_time,-0.12,0.1)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 200)  %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(Zscore = mean(Zscore))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_smooth(se=F,span=0.5)
+
+Trialless %>%  filter(between(rel_time,-0.12,0.1)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 400)  %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(Zscore = mean(Zscore))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_smooth(se=F,span=0.5)
+
+Trialless %>%  filter(between(rel_time,-0.12,0.1)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800)  %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(Zscore = mean(Zscore))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_smooth(se=F,span=0.5)
+
+Trialless %>%  filter(between(rel_time,-0.12,0.1)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um > 1000)  %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(Zscore = mean(Zscore))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_smooth(se=F,span=0.5)
+
+
+
+
+                        
+                        
+                        
+```
+
+```{r}
+zeta_opto <- list.files("H:/Data/aligned/new/extra/zeta/opto", "*.csv", full.names = TRUE) %>%
+  set_names(basename(.) %>% str_remove(".csv")) %>%
+  map_dfr(read_csv, .id = "source_file")
+
+Trialless %>% left_join( zeta_opto %>% unite('cluster_id',source_file,unit))
+
+
+Trialless %>%  filter(between(rel_time,-0.2,1)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% left_join(zeta_opto %>% unite('cluster_id',source_file,unit)) %>%  filter(p_val < 0.05)   %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um > 1000) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type,Animal,condition) %>% summarise(Zscore = mean(Zscore))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_line()+
+   facet_wrap(condition~Animal, scales = "free")
+
+
+Trialless %>%  filter(between(rel_time,-0.2,1)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% left_join(zeta_opto %>% unite('cluster_id',source_file,unit)) %>%  filter(p_val < 0.05)   %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um > 1000) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(Zscore = mean(Zscore))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_line()
+
+```
+
+```{r}
+
+Trialless %>%  filter(between(rel_time,-0.2,1)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(Zscore = mean(rate))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_line(alpha=.5)+
+  geom_smooth(span=0.1,se=F)+
+ggtitle("raw")
+
+
+Trialless %>%  filter(between(rel_time,-0.2,1)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% left_join(zeta_opto %>% unite('cluster_id',source_file,unit)) %>%  filter(p_val < 0.05)   %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(Zscore = mean(rate))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_line(alpha=.5)+
+  geom_smooth(span=0.1,se=F)+
+  ggtitle("optozeta")
+
+Trialless %>%  filter(between(rel_time,-0.2,5)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore ))  %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(Zscore = mean(rate))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+  geom_smooth(span=0.1,se=F)+
+  ggtitle("depth")
+
+Trialless %>%  filter(between(rel_time,-0.2,5)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% left_join(zeta_opto %>% unite('cluster_id',source_file,unit)) %>%  filter(p_val < 0.05)   %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(Zscore = mean(rate))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+  geom_smooth(span=0.1,se=F)+
+  ggtitle("optozeta+depth")
+
+
+
+```
+
+```{r}
+Trialless %>%  filter(between(rel_time,-0.2,1)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type,Animal,condition) %>% summarise(Zscore = mean(rate))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_line(alpha=.5)+
+  geom_smooth(span=0.1,se=F)+
+ggtitle("raw")+
+   facet_wrap(condition~Animal, scales = "free")
+
+
+Trialless %>%  filter(between(rel_time,-0.2,1)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% left_join(zeta_opto %>% unite('cluster_id',source_file,unit)) %>%  filter(p_val < 0.05)   %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type,Animal,condition) %>% summarise(Zscore = mean(rate))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_line(alpha=.5)+
+  geom_smooth(span=0.1,se=F)+
+  ggtitle("optozeta")+
+   facet_wrap(condition~Animal, scales = "free")
+
+Trialless %>%  filter(between(rel_time,-0.2,1)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore ))  %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type,Animal,condition) %>% summarise(Zscore = mean(rate))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_line(alpha=.5)+
+  geom_smooth(span=0.1,se=F)+
+  ggtitle("depth")+
+   facet_wrap(condition~Animal, scales = "free")
+
+Trialless %>%  filter(between(rel_time,-0.2,1)) %>%  mutate(Zscore = replace_na(Zscore,0.01 ), Zscore= ifelse(Zscore > 10000, 0.01,Zscore )) %>% left_join(zeta_opto %>% unite('cluster_id',source_file,unit)) %>%  filter(p_val < 0.05)   %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type,Animal,condition) %>% summarise(Zscore = mean(rate))%>% ggplot(aes(rel_time,Zscore,colour = trial_type))+
+geom_line(alpha=.5)+
+  geom_smooth(span=0.1,se=F)+
+  ggtitle("optozeta+depth")+
+   facet_wrap(condition~Animal, scales = "free")
+
+```
+
+# fr , avg
+
+```{r}
+
+Trialless %>%  filter(between(rel_time,-1,1)) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate )) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(rate = mean(rate))%>% ggplot(aes(rel_time,rate,colour = trial_type))+
+geom_line(alpha=.5)+
+  geom_smooth(span=0.1,se=F)+
+ggtitle("raw")
+
+
+
+
+Trialless %>%  filter(between(rel_time,-1,1)) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate )) %>% left_join(zeta_opto %>% unite('cluster_id',source_file,unit)) %>%  filter(p_val < 0.05)  %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(rate = mean(rate))%>% ggplot(aes(rel_time,rate,colour = trial_type))+
+geom_line(alpha=.5)+
+  geom_smooth(span=0.1,se=F)+
+  ggtitle("optozeta")
+
+Trialless %>%  filter(between(rel_time,-1,5)) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate ))  %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(rate = mean(rate))%>% ggplot(aes(rel_time,rate,colour = trial_type))+
+geom_line(alpha=.5)+
+  geom_smooth(span=0.1,se=F)+
+  ggtitle("depth")
+
+Trialless %>%  filter(between(rel_time,-1,1)) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate )) %>% left_join(zeta_opto %>% unite('cluster_id',source_file,unit)) %>%  filter(p_val < 0.05)   %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(rate = mean(rate))%>% ggplot(aes(rel_time,rate,colour = trial_type))+
+geom_line(alpha=.5)+
+  geom_smooth(span=0.1,se=F)+
+  ggtitle("optozeta+depth")
+
+```
+
+#fr sessions
+
+```{r}
+Trialless %>%  filter(between(rel_time,-1,1)) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate )) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type,Animal,condition) %>% summarise(rate = mean(rate))%>% ggplot(aes(rel_time,rate,colour = trial_type))+
+  geom_smooth(span=0.1,se=F)+
+ggtitle("raw")+
+   facet_wrap(condition~Animal, scales = "free")
+
+
+
+
+Trialless %>%  filter(between(rel_time,-1,1)) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate )) %>% left_join(zeta_opto %>% unite('cluster_id',source_file,unit)) %>%  filter(p_val < 0.05)  %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type,Animal,condition) %>% summarise(rate = mean(rate))%>% ggplot(aes(rel_time,rate,colour = trial_type))+
+  geom_smooth(span=0.1,se=F)+
+  ggtitle("optozeta")+
+   facet_wrap(condition~Animal, scales = "free")
+
+Trialless %>%  filter(between(rel_time,-1,1)) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate ))  %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type,Animal,condition) %>% summarise(rate = mean(rate))%>% ggplot(aes(rel_time,rate,colour = trial_type))+
+  geom_smooth(span=0.1,se=F)+
+  ggtitle("depth")+
+   facet_wrap(condition~Animal, scales = "free")
+
+Trialless %>%  filter(between(rel_time,-1,1)) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate )) %>% left_join(zeta_opto %>% unite('cluster_id',source_file,unit)) %>%  filter(p_val < 0.05)   %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type,Animal,condition) %>% summarise(rate = mean(rate))%>% ggplot(aes(rel_time,rate,colour = trial_type))+
+  geom_smooth(span=0.1,se=F)+
+  ggtitle("optozeta+depth")+
+   facet_wrap(condition~Animal, scales = "free")
+```
+
+# Opto diff
+
+```{r}
+Trialless %>%  filter(between(rel_time,-0.2,5)) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate )) %>% left_join(zeta_opto %>% unite('cluster_id',source_file,unit)) %>%  filter(p_val < 0.05)   %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(rate = mean(rate)) %>% pivot_wider(names_from = trial_type,values_from = rate) %>% mutate(downsweep_diff = Opto_Downsweep-Downsweep, upsweep_diff = Opto_Upwsweep -Upsweep) %>% pivot_longer(cols = c(downsweep_diff,upsweep_diff),names_to = "trial_type",values_to = "fr")%>% ggplot(aes(rel_time,fr,col=trial_type))+
+  geom_line()+
+  geom_smooth(se=F,span=0.1)
+
+Trialless %>%  filter(between(rel_time,-0.2,5)) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate )) %>% left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(rate = mean(rate)) %>% pivot_wider(names_from = trial_type,values_from = rate) %>% mutate(downsweep_diff = Opto_Downsweep-Downsweep, upsweep_diff = Opto_Upwsweep -Upsweep) %>% pivot_longer(cols = c(downsweep_diff,upsweep_diff),names_to = "trial_type",values_to = "fr")%>% ggplot(aes(rel_time,fr,col=trial_type))+
+  geom_line()+
+  geom_smooth(se=F,span=0.1)
+
+
+Trialless %>%  filter(between(rel_time,-0.2,5)) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate )) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type) %>% summarise(rate = mean(rate)) %>% pivot_wider(names_from = trial_type,values_from = rate) %>% mutate(downsweep_diff = Opto_Downsweep-Downsweep, upsweep_diff = Opto_Upwsweep -Upsweep) %>% pivot_longer(cols = c(downsweep_diff,upsweep_diff),names_to = "trial_type",values_to = "fr")%>% ggplot(aes(rel_time,fr,col=trial_type))+
+  geom_line()+
+  geom_smooth(se=F,span=0.1)
+```
+
+# Opto modulation direction
+
+```{r}
+
+dirs <- Trialless %>%  filter(between(rel_time,-10,5)) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate )) %>% left_join(zeta_opto %>% unite('cluster_id',source_file,unit)) %>%  filter(p_val < 0.05)  %>% mutate(chunks = case_when(rel_time < -0.1 ~ "baseline", .default = "audio")) %>% group_by(cluster_id,chunks) %>% summarise(mfr = mean(rate)) %>% pivot_wider(names_from = chunks, values_from = mfr) %>% mutate(diff= audio-baseline) %>% mutate(dir = ifelse(diff > 0, "eh","reduced")) %>%  select(cluster_id,dir)
+
+
+Trialless %>% left_join(dirs) %>%  filter(between(rel_time,-1,1)) %>%left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800) %>%   mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate )) %>% mutate(condition = ifelse(condition =="naivel","naive", condition)) %>%  group_by(rel_time,trial_type,dir) %>% summarise(rate = mean(rate))%>% ggplot(aes(rel_time,rate,colour = trial_type))+
+  geom_smooth(span=0.1,se=F)+
+ggtitle("raw")+
+  facet_wrap(~dir, scales="free")
+
+Trialless %>% left_join(dirs) %>%  filter(between(rel_time,-1,1)) %>%left_join(depths %>% group_by(source_file) %>% mutate(maxdepth = max(dist_from_tip_um)) %>% unite("cluster_id",source_file,unit_id)) %>%  filter(maxdepth-dist_from_tip_um < 800) %>%  mutate(rate = replace_na(rate,0.01 ), rate= ifelse(rate > 10000, 0.01,rate )) %>% mutate(condition = ifelse(condition =="naivel","naive", condition))  %>% distinct(cluster_id,dir) %>% count(dir)
+```

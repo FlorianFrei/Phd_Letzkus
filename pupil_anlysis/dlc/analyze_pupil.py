@@ -6,6 +6,8 @@ Created on Tue Aug 26 16:50:47 2025
 """
 
 # Change working directory to the folder where this script is saved
+
+#%%
 import os
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
@@ -20,10 +22,10 @@ import helpers
 
 
 #%% Settings
-VIDEO_FOLDER = r"D:\pupiltrack"
+VIDEO_FOLDER = r"I:\Data\pupiltrack"
 MIN_CERTAINTY = 0.6
 MAKE_LABELED_VIDEO = True
-CONFIG_PATH = r"C:\Users\Freitag\Documents\GitHub\EyeVideoAnalysis\dlc\config.yaml"
+CONFIG_PATH = r"C:\Users\Freitag\Documents\GitHub\Phd_Letzkus\pupil_anlysis\dlc\dlc\config.yaml"
 
 
 #%% Main pipeline
@@ -115,3 +117,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# %%
