@@ -17,7 +17,7 @@ plan(multisession)
 # 1) LOAD SPEED FILES (original timestamps, no resampling)
 # -------------------------------------------------------
 
-speed_folder <- "H:/Data/speeds/speeds"
+speed_folder <- "I:/Data/aligned/new/binfree/extra/Speed"
 speed_files <- list.files(speed_folder, pattern = "\\.csv$", full.names = TRUE)
 
 load_speed <- function(path) {
@@ -39,8 +39,8 @@ speed_raw <- future_map_dfr(speed_files, load_speed)
 np <- import("numpy")
 
 pupil_files <- list.files(
-  "H:/pupiltrack",
-  pattern = "eye.diameter\\.npy$",
+  "I:/Data/aligned/new/binfree/extra/Eye_dia",
+  pattern = "\\.npy$",
   recursive = TRUE,
   full.names = TRUE
 )
@@ -49,7 +49,7 @@ pupils <- map_df(pupil_files, ~{
   df <- np$load(.x)
   tibble(
     pupil = as.numeric(df),
-    source = basename(dirname(.x))
+    source  = tools::file_path_sans_ext(basename(.x))
   )
 })
 
@@ -58,8 +58,33 @@ pupils <- map_df(pupil_files, ~{
 # 3) LOAD CAMERA DELAY (first TTL)
 # -------------------------------------------------------
 
-cam_delay <- read_csv("H:/Data/speeds/first_camttl.csv") %>%
-  select(source = name, start)
+
+read_csv_folder <- function(folder_path) {
+  # 1. List all CSV files in the directory
+  files <- list.files(
+    path = folder_path, 
+    pattern = "\\.csv$", 
+    full.names = TRUE
+  )
+  
+  # Check if folder is empty to avoid errors
+  if (length(files) == 0) {
+    stop("No CSV files found in the specified directory.")
+  }
+
+  # 2. Read all files into one dataframe
+  # The 'id' argument creates a column with the full file path
+  df <- read_csv(files, id = "file_origin") %>%
+    mutate(
+      # 3. Clean the 'file_origin' column
+      # basename() removes the path, file_path_sans_ext() removes .csv
+      file_origin = tools::file_path_sans_ext(basename(file_origin))
+    )
+  
+  return(df)
+}
+
+cam_delay <- read_csv_folder("I:/Data/aligned/new/binfree/extra/camttl") %>% rename('source' = file_origin)
 
 
 
@@ -68,11 +93,11 @@ cam_delay <- read_csv("H:/Data/speeds/first_camttl.csv") %>%
 # -------------------------------------------------------
 
 pupils <- pupils %>%
-  left_join(cam_delay, by = "source") %>%
+  left_join(cam_delay, by = "source") %>% na.omit() %>% 
   group_by(source) %>%
   mutate(
-    frame = row_number(),
-    time = frame / 25 + start      # camera runs at 25 Hz
+    frame = row_number() ,
+    time = (frame / 25) + camttl      # camera runs at 25 Hz
   )
 
 
@@ -109,15 +134,20 @@ aligned <- pupils %>%
   })
 
 
+```
 
+
+```{r}
 # -------------------------------------------------------
 # DONE
 # -------------------------------------------------------
 
+
+
 # align to sound
 
 # define base folder
-base_dir <- "H:/data/raw"
+base_dir <- "I:/data/raw"
 
 # find all BPOD.csv files recursively
 files <- list.files(base_dir, pattern = "BPOD\\.csv$", recursive = TRUE, full.names = TRUE)
@@ -137,7 +167,7 @@ data <- data_all %>%
   trial_type = case_when(
     trial_type == '1' ~ 'Upsweep',
     trial_type == '2' ~ 'Downsweep',
-    trial_type == '3' ~ 'Opto_Upwsweep',
+    trial_type == '3' ~ 'Opto_Upsweep',
     trial_type == '4' ~ 'Opto_Downsweep',
     TRUE ~ trial_type  # keep anything else as-is
   )
@@ -152,8 +182,36 @@ data <- data_all %>%
 
 
 
+# one interpolation per source
+interp_speed <- function(df_speed, df_pupil) {
+
+  # create interpolation functions for all numeric speed columns
+  speed_cols <- setdiff(names(df_speed), c("sample", "source"))
+
+  funs <- lapply(speed_cols, function(col)
+    approxfun(df_speed$sample, df_speed[[col]], rule = 2)
+  )
+  names(funs) <- speed_cols
+
+  # apply interpolation
+  for (col in speed_cols) {
+    df_pupil[[col]] <- funs[[col]](df_pupil$time)
+  }
+
+  df_pupil
+}
+#pupils <- pupils %>% filter(source!= "output_trimmed")
+# full alignment
+aligned <- pupils %>%
+  group_by(source) %>%
+  group_modify(~{
+    df_speed  <- speed_raw %>% filter(source == .y$source)
+    interp_speed(df_speed, .x)
+  })
 
 
+
+data %>% distinct(state)
 pre <- 5
 post <- 10
 
@@ -165,7 +223,7 @@ for (s in unique(sound$source)) {
   message("Processing: ", s)
   
   cam_delay_s <- cam_delay %>% filter(source == s)
-  cd <- cam_delay_s %>% pull(start)
+  cd <- cam_delay_s %>% pull(camttl)
   
   sound_s <- sound %>% filter(source == s)
   eye <- aligned %>%
@@ -201,6 +259,16 @@ df_segments <- bind_rows(df_segments)
 
 #write_csv(df_segments)
  data %>% distinct(source)
+ cam_delay  %>% distinct(source)
+ sound  <- sound %>% filter(source %in% aligned$source)
+ aligned  %>% distinct(source)
+ 
+ 
+ aligned %>% group_by(source) %>%  mutate( pupil = (pupil - mean(pupil)) / sd(pupil)) %>% ungroup() %>%  summarise(pupil = mean(pupil),.by=c(frame)) %>% ggplot(aes(frame,pupil))+
+   geom_line()+
+   xlim(0,900 *25)
+ 
+gg <- aligned %>%  left_join(sound %>% unite("source", Animal,condition ) %>% select(source,continuous_start,trial_type))
 ```
 
 ```{r}
@@ -215,7 +283,7 @@ for (s in unique(sound$source)) {
   message("Processing: ", s)
   
   cam_delay_s <- cam_delay %>% filter(source == s)
-  cd <- cam_delay_s %>% pull(start)
+  cd <- cam_delay_s %>% pull(camttl)
   
   sound_s <- sound %>% filter(source == s)
   eye <- aligned %>%
@@ -281,6 +349,13 @@ unused_aligned %>% group_by(source) %>%  mutate(maxP = quantile(aligned$pupil, n
   facet_wrap(~source,scales ='free')
 
 #still same
+
+
+df_segments %>% group_by(source) %>%  mutate(maxP = quantile(aligned$pupil, na.rm=T,0.99), minP = quantile(aligned$pupil, na.rm=T,0.01)) %>% filter(between(pupil,minP,maxP))  %>% mutate(pz = (pupil - mean(pupil))/sd(pupil)) %>% group_by(time_bin,stim_id) %>% summarise(pupil  = mean(pz)) %>% ungroup() %>% ggplot(aes(time_bin,pupil,col=stim_id))+
+  geom_line()
+
+
+pupil
 
 ```
 
