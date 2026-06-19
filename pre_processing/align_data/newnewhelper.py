@@ -75,7 +75,7 @@ def load_mat(filename): #TODO NOT MY CODE NORA GAVE TO ME
     data = scipy.io.loadmat(filename, struct_as_record=False, squeeze_me=True)
     return _check_vars(data)
 
-def check_state_alignment(ITI, raw_BPOD):
+def check_state_alignment_old(ITI, raw_BPOD):
     """
     Validates timing alignment between ITI state change times and BPOD trial data
     by comparing intervals between consecutive state changes.
@@ -122,7 +122,77 @@ def check_state_alignment(ITI, raw_BPOD):
     print('✗ No acceptable timing alignment found')
     return False
 
-def BPOD_wrangle_claude(raw_BPOD, ITI, proceed):
+
+def check_state_alignment(ITI, raw_BPOD, n_checks=10, tolerance=0.02):
+    """
+    Validates alignment by comparing ITI pulse intervals against BPOD state durations.
+
+    One ITI pulse fires at each state start; dead-time gaps generate no pulse.
+    For states that are last in their trial, the following ITI interval includes
+    dead-time and will exceed the BPOD state duration — this is expected.
+    Only intra-trial mismatches count as alignment failures.
+    """
+    session_data = raw_BPOD['SessionData']
+    iti_arr = np.asarray(ITI.values if hasattr(ITI, 'values') else ITI, dtype=float)
+
+    print(f"ITI state changes: {len(iti_arr)}")
+    print(f"BPOD trials:       {len(session_data['TrialStartTimestamp'])}")
+
+    # Flatten valid state durations across all trials in recording order.
+    # Track which states are last in their trial (cross-trial boundary follows).
+    bpod_durations = []
+    is_last_in_trial = []
+
+    for trial_data in session_data['RawEvents']['Trial']:
+        trial_states = []
+        for times in trial_data['States'].values():
+            if times is None:
+                continue
+            times_arr = np.atleast_1d(times).astype(float)
+            if len(times_arr) == 2 and not np.any(np.isnan(times_arr)):
+                trial_states.append((float(times_arr[0]), float(times_arr[1]) - float(times_arr[0])))
+
+        trial_states.sort(key=lambda x: x[0])
+        durations = [d for _, d in trial_states]
+        bpod_durations.extend(durations)
+        if durations:
+            is_last_in_trial.extend([False] * (len(durations) - 1) + [True])
+
+    iti_intervals = np.diff(iti_arr)
+    n = min(n_checks, len(bpod_durations) - 1, len(iti_intervals))
+
+    print(f"\nFirst {n} intervals (* = cross-trial boundary, dead-time is expected):")
+    print(f"{'#':>3}  {'':5}  {'ITI interval':>12}  {'BPOD duration':>13}  {'diff':>8}")
+    print("-" * 55)
+
+    passed_intra = 0
+    total_intra  = 0
+
+    for i in range(n):
+        at_boundary = is_last_in_trial[i]
+        diff = iti_intervals[i] - bpod_durations[i]  # positive = dead-time absorbed
+
+        if at_boundary:
+            ok    = diff >= -tolerance  # only fail if ITI is shorter than BPOD duration
+            label = f"{'✓' if ok else '✗'}*"
+        else:
+            ok    = abs(diff) < tolerance
+            label = f"{'✓' if ok else '✗'} "
+            total_intra += 1
+            if ok:
+                passed_intra += 1
+
+        print(f"{i+1:>3}  {label:<5}  {iti_intervals[i]:>12.4f}  {bpod_durations[i]:>13.4f}  {diff:>+8.4f}s")
+
+    print("-" * 55)
+    if total_intra > 0:
+        print(f"Intra-trial pairs passing: {passed_intra}/{total_intra}")
+
+    result = (total_intra == 0) or (passed_intra / total_intra >= 0.5)
+    print("✓ Alignment acceptable\n" if result else "✗ Alignment failed — review output above\n")
+    return result
+
+def BPOD_wrangle_claude_old(raw_BPOD, ITI, proceed):
     """
     Takes raw MATLAB BPOD data and transforms it into a DataFrame of all trials.
     
@@ -214,7 +284,95 @@ def BPOD_wrangle_claude(raw_BPOD, ITI, proceed):
     combined_df['trial_type'] = trial_types
     
     return combined_df
-        
+
+def BPOD_wrangle_claude(raw_BPOD, ITI, proceed):
+    """
+    Transforms raw BPOD data into a time-aligned DataFrame.
+
+    ITI has one pulse per real state start; dead-time intervals generate no pulse.
+    Dead-time rows are reconstructed after ITI mapping rather than being
+    assigned ITI timestamps, which would silently shift all subsequent rows.
+    """
+    if not proceed:
+        print("Stop, this is not gonna work")
+        return None
+
+    session_data = raw_BPOD['SessionData']
+    iti_arr  = np.asarray(ITI.values if hasattr(ITI, 'values') else ITI, dtype=float)
+    n_trials = len(session_data['TrialStartTimestamp'])
+
+    # --- 1. Real-states-only DataFrame (no dead_time rows yet) ---
+    trial_dataframes = []
+    for trial_idx, trial_data in enumerate(session_data['RawEvents']['Trial']):
+        states_df = pd.DataFrame.from_dict(trial_data['States']).transpose()
+        states_df['state_name']   = states_df.index
+        states_df['trial_number'] = trial_idx
+        trial_dataframes.append(states_df)
+
+    combined_df = pd.concat(trial_dataframes, ignore_index=True)
+    combined_df = combined_df.dropna().reset_index(drop=True)   # drop unvisited states
+    combined_df['state_duration'] = combined_df[1] - combined_df[0]
+
+    n_real_states = len(combined_df)
+    n_iti         = len(iti_arr)
+
+    print(f"Real BPOD states: {n_real_states}")
+    print(f"ITI pulses:       {n_iti}")
+
+    if n_iti < n_real_states:
+        print(f"Error: {n_iti} ITI pulses for {n_real_states} states — cannot proceed")
+        return None
+    if n_iti > n_real_states:
+        print(f"Warning: {n_iti - n_real_states} extra ITI pulses — trimming")
+
+    # --- 2. 1:1 mapping: each real state gets its ITI start timestamp ---
+    combined_df['continuous_start'] = iti_arr[:n_real_states]
+    combined_df['continuous_time']  = combined_df['continuous_start'] + combined_df['state_duration']
+
+    # --- 3. Reconstruct dead_time rows from ITI gaps between trials ---
+    # dead_time[N] = ITI[first_pulse_of_trial_N+1] - continuous_time[last_state_of_trial_N]
+    trial_state_counts = (
+        combined_df.groupby('trial_number', sort=True)
+                   .size()
+                   .reindex(range(n_trials), fill_value=0)
+    )
+    first_iti_idx = np.concatenate([[0], np.cumsum(trial_state_counts.values)[:-1]])
+
+    dead_time_rows = []
+    for trial_idx in range(n_trials):
+        trial_mask = combined_df['trial_number'] == trial_idx
+        if not trial_mask.any():
+            continue
+
+        dead_start = combined_df.loc[trial_mask, 'continuous_time'].max()
+
+        if trial_idx + 1 < n_trials:
+            next_idx = int(first_iti_idx[trial_idx + 1])
+            dead_end = iti_arr[next_idx] if next_idx < n_real_states else dead_start
+        else:
+            dead_end = dead_start  # no dead_time after the final trial
+
+        dead_duration = dead_end - dead_start
+        if dead_duration > 1e-4:
+            dead_time_rows.append({
+                0: np.nan, 1: np.nan,
+                'state_name':      'dead_time',
+                'trial_number':    int(trial_idx),
+                'state_duration':  dead_duration,
+                'continuous_start': dead_start,
+                'continuous_time':  dead_end,
+            })
+
+    if dead_time_rows:
+        combined_df = pd.concat([combined_df, pd.DataFrame(dead_time_rows)], ignore_index=True)
+
+    # --- 4. Temporal sort and trial-type annotation ---
+    combined_df = combined_df.sort_values('continuous_start').reset_index(drop=True)
+    combined_df['trial_type'] = combined_df['trial_number'].map(
+        lambda n: session_data['TrialTypes'][int(n)]
+    )
+
+    return combined_df
 
 def add_sound_delays(BPOD, ttlsound):
     """
@@ -227,7 +385,7 @@ def add_sound_delays(BPOD, ttlsound):
     Returns:
         Modified BPOD DataFrame with sound_delay states inserted
     """
-    sound_types = ['Downsweep', 'Opto_Downsweep', 'Opto_Upwsweep', 'Upsweep']
+    sound_types = ['Downsweep', 'Opto_Downsweep', 'Opto_Upsweep', 'Upsweep']
     result_rows = []
     ttl_index = 0
     
@@ -454,7 +612,7 @@ def process_neural_data_pipeline(basepath, output_filename='processed_data.csv',
     events_with_behv_noBin = annotate_spikes_interval_join(Ephys_good, BPOD, spike_time_col='seconds')
     
     # --- Step 10: Mapping Trial Types for Plotting ---
-    mapping = {'1': 'Upsweep', '2': 'Downsweep', '3': 'Opto_Upsweep', '4': 'Opto_Downsweep'}
+    mapping = {'0': 'Laser_Only', '1': 'Upsweep', '2': 'Downsweep', '3': 'Opto_Upsweep', '4': 'Opto_Downsweep'}
     trial_types_mapped = (
         BPOD.groupby("trial_number")["trial_type"]
         .unique().explode().astype(str).map(mapping).fillna('Unknown').values
