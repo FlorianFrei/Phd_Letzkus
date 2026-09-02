@@ -123,7 +123,7 @@ def check_state_alignment_old(ITI, raw_BPOD):
     return False
 
 
-def check_state_alignment(ITI, raw_BPOD, n_checks=10, tolerance=0.02):
+def check_state_alignment_old(ITI, raw_BPOD, n_checks=10, tolerance=0.02):
     """
     Validates alignment by comparing ITI pulse intervals against BPOD state durations.
 
@@ -285,96 +285,230 @@ def BPOD_wrangle_claude_old(raw_BPOD, ITI, proceed):
     
     return combined_df
 
-def BPOD_wrangle_claude(raw_BPOD, ITI, proceed):
-    """
-    Transforms raw BPOD data into a time-aligned DataFrame.
+def _collect_bpod_durations(session_data):
+    """Shared by check_state_alignment and BPOD_wrangle_claude: flattens per-trial
+    state durations in recording order, flagging which are last-in-trial
+    (followed by a dead-time gap, so their next ITI interval is expected to be inflated)."""
+    bpod_durations = []
+    is_last_in_trial = []
+    for trial_data in session_data['RawEvents']['Trial']:
+        trial_states = []
+        for times in trial_data['States'].values():
+            if times is None:
+                continue
+            times_arr = np.atleast_1d(times).astype(float)
+            if len(times_arr) == 2 and not np.any(np.isnan(times_arr)):
+                trial_states.append((float(times_arr[0]), float(times_arr[1]) - float(times_arr[0])))
+        trial_states.sort(key=lambda x: x[0])
+        durations = [d for _, d in trial_states]
+        bpod_durations.extend(durations)
+        if durations:
+            is_last_in_trial.extend([False] * (len(durations) - 1) + [True])
+    return bpod_durations, is_last_in_trial
 
-    ITI has one pulse per real state start; dead-time intervals generate no pulse.
-    Dead-time rows are reconstructed after ITI mapping rather than being
-    assigned ITI timestamps, which would silently shift all subsequent rows.
+
+def _find_pulse_offset(iti_arr, bpod_durations, is_last_in_trial, max_offset, n_checks=10, tolerance=0.02):
     """
+    Tests candidate front-offsets (0..max_offset) and scores each by how well
+    INTRA-TRIAL ITI intervals match known BPOD state durations. Boundary
+    (last-in-trial) intervals are skipped since dead-time inflates them and
+    they carry no information about offset correctness.
+    Returns (best_offset, score, n_compared).
+    """
+    best_offset, best_score, best_n = 0, -1, 0
+    for offset in range(max_offset + 1):
+        shifted = iti_arr[offset:]
+        iti_intervals = np.diff(shifted)
+        n = min(n_checks, len(bpod_durations) - 1, len(iti_intervals))
+
+        passed = total = 0
+        for i in range(n):
+            if is_last_in_trial[i]:
+                continue
+            total += 1
+            if abs(iti_intervals[i] - bpod_durations[i]) < tolerance:
+                passed += 1
+
+        score = (passed / total) if total else 0.0
+        if score > best_score:
+            best_offset, best_score, best_n = offset, score, total
+        if score == 1.0:
+            break
+
+    return best_offset, best_score, best_n
+
+
+def _build_row_skeleton(session_data):
+    """
+    Single source of truth for row order: real states (dropna'd) interleaved
+    with dead_time placeholders, in true pulse order, one row per expected
+    ITI pulse. Used by BOTH check_state_alignment and BPOD_wrangle_claude so
+    the two can never drift out of sync with each other.
+
+    Returns:
+        combined_df: rows with state_name/trial_number, real durations filled,
+                     dead_time rows present but undated.
+        known_duration: np.array, same length as combined_df. Real-state rows
+                     hold their BPOD-measured duration; dead_time rows are NaN
+                     (unknown — that's what we're solving for, so they must be
+                     SKIPPED in comparisons, never treated as a 0 or missing slot).
+    """
+    n_trials = len(session_data['TrialStartTimestamp'])
+    trial_dataframes = []
+
+    for trial_idx, trial_data in enumerate(session_data['RawEvents']['Trial']):
+        states_df = pd.DataFrame.from_dict(trial_data['States']).transpose()
+        states_df['state_name'] = states_df.index
+        states_df['trial_number'] = trial_idx
+        states_df = states_df.dropna()
+        states_df = states_df.sort_values(0)  # ensure recording order within trial
+
+        if trial_idx < n_trials - 1:
+            dead_row = pd.DataFrame({
+                0: [np.nan], 1: [np.nan],
+                'state_name': ['dead_time'],
+                'trial_number': [trial_idx],
+            })
+            states_df = pd.concat([states_df, dead_row], ignore_index=True)
+
+        trial_dataframes.append(states_df)
+
+    combined_df = pd.concat(trial_dataframes, ignore_index=True)
+    known_duration = np.where(
+        combined_df['state_name'] == 'dead_time',
+        np.nan,
+        combined_df[1] - combined_df[0]
+    )
+    return combined_df, known_duration
+
+
+def check_state_alignment(ITI, raw_BPOD, n_checks=10, tolerance=0.02):
+    """
+    Validates alignment using the SAME row skeleton as BPOD_wrangle_claude,
+    so iti_intervals[i] and known_duration[i] always refer to the same row.
+    Dead-time rows (known_duration is NaN) are skipped entirely — they carry
+    no comparison information, they're not "expected mismatches" to be lenient about.
+    """
+    session_data = raw_BPOD['SessionData']
+    iti_arr = np.asarray(ITI.values if hasattr(ITI, 'values') else ITI, dtype=float)
+    combined_df, known_duration = _build_row_skeleton(session_data)
+
+    print(f"ITI state changes: {len(iti_arr)}")
+    print(f"BPOD trials:       {len(session_data['TrialStartTimestamp'])}")
+
+    iti_intervals = np.diff(iti_arr)
+    n = min(n_checks, len(known_duration), len(iti_intervals))
+
+    print(f"\nFirst {n} rows (dead_time rows shown but not scored):")
+    print(f"{'#':>3}  {'':5}  {'ITI interval':>12}  {'BPOD duration':>13}  {'diff':>8}  {'row':>10}")
+    print("-" * 70)
+
+    passed = total = 0
+    for i in range(n):
+        row_name = combined_df['state_name'].iloc[i]
+        if np.isnan(known_duration[i]):
+            print(f"{i+1:>3}  {'skip':<5}  {iti_intervals[i]:>12.4f}  {'--':>13}  {'--':>8}  {row_name:>10}")
+            continue
+        diff = iti_intervals[i] - known_duration[i]
+        ok = abs(diff) < tolerance
+        total += 1
+        passed += ok
+        print(f"{i+1:>3}  {'✓' if ok else '✗':<5}  {iti_intervals[i]:>12.4f}  {known_duration[i]:>13.4f}  {diff:>+8.4f}s  {row_name:>10}")
+
+    print("-" * 70)
+    if total == 0:
+        print("Warning: no scorable (non-dead-time) rows in this window — "
+              "increase n_checks, this result is NOT evidence of alignment")
+        return False  # don't vacuously pass
+    print(f"Scorable rows passing: {passed}/{total}")
+    result = passed / total >= 0.5
+    print("✓ Alignment acceptable\n" if result else "✗ Alignment failed — review output above\n")
+    return result
+
+
+def _find_pulse_offset(iti_arr, known_duration, max_offset, n_checks=10, tolerance=0.02):
+    """Same fix applied here: scores candidate offsets using the shared
+    known_duration skeleton, skipping NaN (dead_time) rows."""
+    best_offset, best_score, best_n = 0, -1, 0
+    for offset in range(max_offset + 1):
+        iti_intervals = np.diff(iti_arr[offset:])
+        n = min(n_checks * 3, len(known_duration), len(iti_intervals))  # widen window past baseline block
+
+        passed = total = 0
+        for i in range(n):
+            if np.isnan(known_duration[i]):
+                continue
+            total += 1
+            if abs(iti_intervals[i] - known_duration[i]) < tolerance:
+                passed += 1
+
+        score = (passed / total) if total else -1  # no data => can't judge, don't treat as 0
+        if score > best_score:
+            best_offset, best_score, best_n = offset, score, total
+        if score == 1.0:
+            break
+
+    return best_offset, best_score, best_n
+
+
+def BPOD_wrangle_claude(raw_BPOD, ITI, proceed, n_checks=10, tolerance=0.02):
     if not proceed:
         print("Stop, this is not gonna work")
         return None
 
     session_data = raw_BPOD['SessionData']
-    iti_arr  = np.asarray(ITI.values if hasattr(ITI, 'values') else ITI, dtype=float)
-    n_trials = len(session_data['TrialStartTimestamp'])
+    iti_arr = np.asarray(ITI.values if hasattr(ITI, 'values') else ITI, dtype=float)
+    combined_df, known_duration = _build_row_skeleton(session_data)
 
-    # --- 1. Real-states-only DataFrame (no dead_time rows yet) ---
-    trial_dataframes = []
-    for trial_idx, trial_data in enumerate(session_data['RawEvents']['Trial']):
-        states_df = pd.DataFrame.from_dict(trial_data['States']).transpose()
-        states_df['state_name']   = states_df.index
-        states_df['trial_number'] = trial_idx
-        trial_dataframes.append(states_df)
+    n_rows = len(combined_df)
+    n_iti = len(iti_arr)
+    print(f"Rows (real states + dead_time placeholders): {n_rows}")
+    print(f"ITI pulses: {n_iti}")
 
-    combined_df = pd.concat(trial_dataframes, ignore_index=True)
-    combined_df = combined_df.dropna().reset_index(drop=True)   # drop unvisited states
-    combined_df['state_duration'] = combined_df[1] - combined_df[0]
-
-    n_real_states = len(combined_df)
-    n_iti         = len(iti_arr)
-
-    print(f"Real BPOD states: {n_real_states}")
-    print(f"ITI pulses:       {n_iti}")
-
-    if n_iti < n_real_states:
-        print(f"Error: {n_iti} ITI pulses for {n_real_states} states — cannot proceed")
+    if n_iti < n_rows:
+        print(f"Error: {n_rows - n_iti} rows have no ITI pulse — cannot proceed")
         return None
-    if n_iti > n_real_states:
-        print(f"Warning: {n_iti - n_real_states} extra ITI pulses — trimming")
 
-    # --- 2. 1:1 mapping: each real state gets its ITI start timestamp ---
-    combined_df['continuous_start'] = iti_arr[:n_real_states]
-    combined_df['continuous_time']  = combined_df['continuous_start'] + combined_df['state_duration']
+    if n_iti > n_rows:
+        extra = n_iti - n_rows
+        offset, score, n_compared = _find_pulse_offset(
+            iti_arr, known_duration, max_offset=extra, n_checks=n_checks, tolerance=tolerance
+        )
+        print(f"Front-alignment check: best offset={offset} "
+              f"(match {score:.0%} over {n_compared} pairs)" if score >= 0
+              else "Front-alignment check: no scorable pairs found — cannot verify, proceeding with caution")
 
-    # --- 3. Reconstruct dead_time rows from ITI gaps between trials ---
-    # dead_time[N] = ITI[first_pulse_of_trial_N+1] - continuous_time[last_state_of_trial_N]
-    trial_state_counts = (
-        combined_df.groupby('trial_number', sort=True)
-                   .size()
-                   .reindex(range(n_trials), fill_value=0)
+        if 0 <= score < 0.5:
+            print("Warning: front-alignment is poor even after searching offsets — "
+                  "inspect manually before trusting this mapping")
+
+        if offset > 0:
+            print(f"Dropping {offset} leading pulse(s) (confirmed pre-first-state)")
+            iti_arr = iti_arr[offset:]
+
+        remaining_extra = len(iti_arr) - n_rows
+        if remaining_extra > 0:
+            print(f"Dropping {remaining_extra} trailing pulse(s) (after front-alignment)")
+            iti_arr = iti_arr[:n_rows]
+
+    combined_df['continuous_start'] = iti_arr[:n_rows]
+    combined_df['state_duration'] = combined_df[1] - combined_df[0]
+    combined_df['continuous_time'] = combined_df['continuous_start'] + combined_df['state_duration']
+
+    dead_mask = combined_df['state_name'] == 'dead_time'
+    next_start = combined_df['continuous_start'].shift(-1)
+    combined_df.loc[dead_mask, 'continuous_time'] = next_start[dead_mask]
+    combined_df.loc[dead_mask, 'state_duration'] = (
+        combined_df.loc[dead_mask, 'continuous_time'] - combined_df.loc[dead_mask, 'continuous_start']
     )
-    first_iti_idx = np.concatenate([[0], np.cumsum(trial_state_counts.values)[:-1]])
 
-    dead_time_rows = []
-    for trial_idx in range(n_trials):
-        trial_mask = combined_df['trial_number'] == trial_idx
-        if not trial_mask.any():
-            continue
-
-        dead_start = combined_df.loc[trial_mask, 'continuous_time'].max()
-
-        if trial_idx + 1 < n_trials:
-            next_idx = int(first_iti_idx[trial_idx + 1])
-            dead_end = iti_arr[next_idx] if next_idx < n_real_states else dead_start
-        else:
-            dead_end = dead_start  # no dead_time after the final trial
-
-        dead_duration = dead_end - dead_start
-        if dead_duration > 1e-4:
-            dead_time_rows.append({
-                0: np.nan, 1: np.nan,
-                'state_name':      'dead_time',
-                'trial_number':    int(trial_idx),
-                'state_duration':  dead_duration,
-                'continuous_start': dead_start,
-                'continuous_time':  dead_end,
-            })
-
-    if dead_time_rows:
-        combined_df = pd.concat([combined_df, pd.DataFrame(dead_time_rows)], ignore_index=True)
-
-    # --- 4. Temporal sort and trial-type annotation ---
     combined_df = combined_df.sort_values('continuous_start').reset_index(drop=True)
     combined_df['trial_type'] = combined_df['trial_number'].map(
         lambda n: session_data['TrialTypes'][int(n)]
     )
-
     return combined_df
 
-def add_sound_delays(BPOD, ttlsound):
+def add_sound_delays_old(BPOD, ttlsound):
     """
     Simple function to add sound_delay states and adjust sound timing
     
@@ -429,6 +563,87 @@ def add_sound_delays(BPOD, ttlsound):
 
 
     return BPOD
+
+def add_sound_delays(BPOD, ttlsound, tolerance_max=0.1):
+    """
+    Inserts sound_delay states and re-times sound-state rows using ttlsound
+    as ground truth.
+
+    ttlsound may contain extra pulses (e.g. leading test/calibration pulses)
+    that don't correspond to any real sound-state row. Blindly consuming
+    ttlsound in order desyncs ttl_index permanently from the first such
+    extra pulse onward. We verify the correct starting offset first, using
+    the same principle as the ITI alignment check: true delays must be
+    small and non-negative.
+    """
+    sound_types = ['Downsweep', 'Opto_Downsweep', 'Opto_Upsweep', 'Upsweep']
+    ttl_arr = np.asarray(ttlsound.values if hasattr(ttlsound, 'values') else ttlsound, dtype=float)
+  # rising edges only, assuming rising-falling-rising-falling...
+    sound_rows = BPOD[BPOD['state_name'].isin(sound_types)]
+    n_sound = len(sound_rows)
+    n_ttl = len(ttl_arr)
+    print(f"Sound-state rows in BPOD: {n_sound}")
+    print(f"ttlsound pulses: {n_ttl}")
+
+    if n_ttl < n_sound:
+        raise ValueError(f"Not enough ttlsound pulses ({n_ttl}) for {n_sound} sound states")
+
+    max_offset = n_ttl - n_sound
+    starts = sound_rows['continuous_start'].values
+
+    best_offset, best_score = 0, -1
+    for offset in range(max_offset + 1):
+        candidate = ttl_arr[offset: offset + n_sound]
+        delays = candidate - starts
+        valid = np.sum((delays > -0.001) & (delays < tolerance_max))
+        score = valid / n_sound
+        if score > best_score:
+            best_offset, best_score = offset, score
+        if score == 1.0:
+            break
+
+    print(f"Best ttlsound offset={best_offset} (valid delays: {best_score:.0%})")
+    if best_score < 1.0:
+        print("Warning: some sound rows have implausible delays even after offset search — "
+              "inspect manually before trusting this mapping")
+
+    ttl_arr = ttl_arr[best_offset:]  # apply the verified offset once, up front
+
+    result_rows = []
+    ttl_index = 0
+
+    for _, row in BPOD.iterrows():
+        result_rows.append(row.copy())
+
+        if row['state_name'] in sound_types:
+            if ttl_index >= len(ttl_arr):
+                raise ValueError(f"Not enough TTL values for sound state (trial {row['trial_number']})")
+
+            bpod_start = row['continuous_start']
+            actual_sound_time = ttl_arr[ttl_index]
+            delay_duration = actual_sound_time - bpod_start
+
+            if delay_duration <= -0.001:
+                raise ValueError(
+                    f"Sound plays before BPOD signal: delay = {delay_duration} "
+                    f"(trial {row['trial_number']}, state {row['state_name']})"
+                )
+
+            delay_row = row.copy()
+            delay_row['state_name'] = 'sound_delay'
+            delay_row['continuous_start'] = bpod_start
+            delay_row['continuous_time'] = actual_sound_time
+            delay_row['state_duration'] = delay_duration
+            result_rows.insert(-1, delay_row)
+
+            sound_row = result_rows[-1]
+            original_sound_end = sound_row['continuous_time']
+            sound_row['continuous_start'] = actual_sound_time
+            sound_row['state_duration'] = original_sound_end - actual_sound_time
+
+            ttl_index += 1
+
+    return pd.DataFrame(result_rows).reset_index(drop=True)
 
 
 def Ephys_wrangle(spike_times):
@@ -534,23 +749,30 @@ def plot_psth(spike_times, stim_times, save_path=None, window=(-2, 6), bin_size=
         plt.savefig(save_path)
     plt.close()
 
-def plot_psth_by_type(spike_times, stim_times, types, save_path=None, window=(-2, 6), bin_size=0.01, sigma=8):
-    """Plots and saves PSTHs grouped by stimulus type."""
+def plot_psth_by_type(spike_times, stim_times, stim_types, save_path=None, window=(-2, 6), bin_size=0.01, sigma=8):
+    """
+    Plot PSTHs grouped by stimulus type.
+    stim_times and stim_types must be 1:1 paired arrays of equal length.
+    """
     spike_times = np.asarray(spike_times).flatten()
-    stim_times = np.asarray(stim_times).flatten()
-    types = np.asarray(types)
+    stim_times  = np.asarray(stim_times).flatten()
+    stim_types  = np.asarray(stim_types)
 
-    bins = np.arange(window[0], window[1], bin_size)
-    centers = (bins[:-1] + bins[1:]) / 2
-    unique_types = np.unique(types)
-    colors = plt.cm.get_cmap('tab10', len(unique_types))
+    assert len(stim_times) == len(stim_types), (
+        f"stim_times ({len(stim_times)}) and stim_types ({len(stim_types)}) must be the same length"
+    )
+
+    bins         = np.arange(window[0], window[1], bin_size)
+    centers      = (bins[:-1] + bins[1:]) / 2
+    unique_types = np.unique(stim_types)
+    colors       = plt.cm.get_cmap('tab10', len(unique_types))
 
     plt.figure(figsize=(10, 5))
 
     for i, ttype in enumerate(unique_types):
-        type_mask = (types == ttype)
-        # Match stim times to types (assumes 1:1 mapping)
-        relevant_stim_times = stim_times[:len(types)][type_mask]
+        type_mask            = (stim_types == ttype)
+        relevant_stim_times  = stim_times[type_mask]          # direct mask, no slicing
+        n                    = type_mask.sum()
 
         all_aligned_spikes = []
         for t in relevant_stim_times:
@@ -558,11 +780,11 @@ def plot_psth_by_type(spike_times, stim_times, types, save_path=None, window=(-2
             mask = (aligned_spikes >= window[0]) & (aligned_spikes < window[1])
             all_aligned_spikes.extend(aligned_spikes[mask])
 
-        if len(relevant_stim_times) > 0:
+        if n > 0:
             counts, _ = np.histogram(all_aligned_spikes, bins=bins)
-            rate = counts / (len(relevant_stim_times) * bin_size)
+            rate         = counts / (n * bin_size)
             rate_smoothed = gaussian_filter1d(rate, sigma=sigma)
-            plt.plot(centers, rate_smoothed, label=f'Type: {ttype}', color=colors(i))
+            plt.plot(centers, rate_smoothed, label=f'{ttype} (n={n})', color=colors(i))
 
     plt.axvline(0, color='black', linestyle='--', label='Stimulus onset')
     plt.xlabel('Time (s) from stimulus')
@@ -570,7 +792,7 @@ def plot_psth_by_type(spike_times, stim_times, types, save_path=None, window=(-2
     plt.title('PSTH by Stimulus Type')
     plt.legend()
     plt.tight_layout()
-    
+
     if save_path:
         plt.savefig(save_path)
     plt.close()
@@ -590,7 +812,25 @@ def process_neural_data_pipeline(basepath, output_filename='processed_data.csv',
         raw_BPOD = load_mat(basepath / mat_name)
         
         ttlsound_df = pd.read_csv(basepath / 'Meta' / 'Audio.csv')
-        ttlsound = ttlsound_df[ttlsound_df['edge_type'] == 'rising'].iloc[:, 0].values
+
+        edge_types = ttlsound_df['edge_type'].astype(str).str.strip().str.lower()
+        audio_edges = ttlsound_df.iloc[:, 0].to_numpy(dtype=float)
+
+        if edge_types.nunique(dropna=True) == 1:
+            # edge_type is unusable because every row has the same label.
+            # Assume the rows alternate rising, falling, rising, falling, ...
+            print(
+                "Warning: all Audio.csv edge_type values are identical; "
+                "using every second edge (0::2) as the rising-edge timestamps."
+            )
+            ttlsound = audio_edges[0::2]
+        else:
+            # Use the explicitly labelled rising edges.
+            ttlsound = audio_edges[edge_types.to_numpy() == 'rising']
+
+        print(f"Sound alignment TTLs: {len(ttlsound)}") 
+
+
     except Exception as e:
         raise RuntimeError(f"Error loading data: {str(e)}")
     
@@ -617,16 +857,55 @@ def process_neural_data_pipeline(basepath, output_filename='processed_data.csv',
         BPOD.groupby("trial_number")["trial_type"]
         .unique().explode().astype(str).map(mapping).fillna('Unknown').values
     )
+# --- Step 10: Build unified stimulus event table ---
+    # ttlsound contains only HiFi events (types 1-4); Laser_Only uses WavePlayer1
+    # and has no Audio.csv entry, so its onset must come from BPOD directly.
+    mapping = {
+        '0': 'Laser_Only',
+        '1': 'Upsweep',
+        '2': 'Downsweep',
+        '3': 'Opto_Upsweep',
+        '4': 'Opto_Downsweep',
+    }
+
+    # Laser_Only onsets: start of each Laser_Only state row in BPOD
+    laser_times = BPOD.loc[BPOD['state_name'] == 'Laser_Only', 'continuous_start'].values
+    laser_types = np.array(['Laser_Only'] * len(laser_times))
+
+    # Sound-trial types (types 1-4), one per trial, in trial order → must pair 1:1 with ttlsound
+    per_trial_type = (
+        BPOD.groupby('trial_number')['trial_type']
+        .first()
+        .apply(lambda x: mapping.get(str(int(float(x))), 'Unknown'))
+    )
+    sound_types_arr = per_trial_type[per_trial_type != 'Laser_Only'].values
+    
+    if len(sound_types_arr) != len(ttlsound):
+        print(
+            f"Warning: {len(sound_types_arr)} sound trial types vs "
+            f"{len(ttlsound)} TTL pulses — check trial count and Audio.csv"
+        )
+
+    # Merge and sort chronologically
+    all_stim_times = np.concatenate([laser_times, ttlsound])
+    all_stim_types = np.concatenate([laser_types, sound_types_arr])
+    sort_idx       = np.argsort(all_stim_times)
+    all_stim_times = all_stim_times[sort_idx]
+    all_stim_types = all_stim_types[sort_idx]
+
+    print(f"Stimulus events: {dict(zip(*np.unique(all_stim_types, return_counts=True)))}")
 
     # --- Step 11: Plotting ---
     plot_dir = basepath / 'plots'
     plot_dir.mkdir(exist_ok=True)
-    
-    # Use raw seconds for the most accurate PSTH
+
     raw_spike_seconds = Ephys_good['seconds'].values
-    
-    plot_psth(raw_spike_seconds, ttlsound, save_path=plot_dir / 'psth_overall.png')
-    plot_psth_by_type(raw_spike_seconds, ttlsound, trial_types_mapped, save_path=plot_dir / 'psth_by_type.png')
+
+    # Overall PSTH uses all event onsets (Laser_Only + sounds)
+    plot_psth(raw_spike_seconds, all_stim_times, save_path=plot_dir / 'psth_overall.png')
+    # Per-type PSTH uses the paired (times, types) arrays
+    plot_psth_by_type(raw_spike_seconds, all_stim_times, all_stim_types,
+                      save_path=plot_dir / 'psth_by_type.png')
 
     # --- Step 12: Saving CSVs ---
     # Filter columns to keep it clean
