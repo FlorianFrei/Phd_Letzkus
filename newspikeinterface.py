@@ -961,7 +961,7 @@ def run_batch(folders):
 
 if __name__ == "__main__":
     folders = [
-        r"I:\Data\raw\8181\8181_naive"
+        r"I:\Data\raw\8155\8155_naive"
   
 
     ]

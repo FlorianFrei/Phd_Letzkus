@@ -576,7 +576,7 @@ def add_sound_delays(BPOD, ttlsound, tolerance_max=0.1):
     the same principle as the ITI alignment check: true delays must be
     small and non-negative.
     """
-    sound_types = ['Downsweep', 'Opto_Downsweep', 'Opto_Upsweep', 'Upsweep']
+    sound_types = ['Downsweep', 'Opto_Downsweep', 'Opto_Upsweep', 'Upsweep','Opto_Upwsweep']
     ttl_arr = np.asarray(ttlsound.values if hasattr(ttlsound, 'values') else ttlsound, dtype=float)
   # rising edges only, assuming rising-falling-rising-falling...
     sound_rows = BPOD[BPOD['state_name'].isin(sound_types)]
@@ -798,7 +798,7 @@ def plot_psth_by_type(spike_times, stim_times, stim_types, save_path=None, windo
     plt.close()
 
 @timeit
-def process_neural_data_pipeline(basepath, output_filename='processed_data.csv', bin_size=0.01, time_window=None):
+def process_neural_data_pipeline(basepath, output_filename='processed_data.csv', bin_size=0.01, time_window=None, output_filename2='noBin.csv'):
     basepath = Path(basepath)
     print(f"Starting neural data processing pipeline for: {basepath}")
     
@@ -917,7 +917,7 @@ def process_neural_data_pipeline(basepath, output_filename='processed_data.csv',
     
     # Save noBin
     out_no_bin = events_with_behv_noBin[cols_to_keep + ['seconds']]
-    out_no_bin.to_csv(basepath / 'noBin.csv', index=False)
+    out_no_bin.to_csv(basepath / output_filename2, index=False)
     
     BPOD.to_csv(basepath / 'BPOD.csv')
 

@@ -1,0 +1,802 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+```{r}
+library(tidyverse)
+library(furrr)
+library(reticulate)
+np <- import("numpy")
+source("C:/Users/Freitag/Documents/GitHub/Phd_Letzkus/analysis/general/data_helpers.R")
+
+
+pupil_path <- "I:/Data/aligned/all_good/Behv/Pupils"
+blink_path <- "I:/Data/aligned/all_good/Behv/blinks"
+CamDelay_path <-"I:/Data/aligned/all_good/Behv/FirstCamTtl"
+BPOD_path <- "I:/Data/aligned/all_good/Behv/BPOD"
+shock_file <- "I:/Data/aligned/extra/Shock_direction.csv"
+Animal_list <- c("8103","8104","8155","8181","8182","8186","8251","8252","8272","8273")
+
+
+
+sound_starts <- load_sound_starts(BPOD_path)
+shock <- load_shock_direction(shock_file)
+
+```
+
+
+```{r}
+
+
+
+pupil_files <- list.files(
+  pupil_path,
+  pattern = "\\.npy$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+pupils <- map_df(pupil_files, ~{
+  df <- np$load(.x)
+  tibble(
+    pupil = as.numeric(df),
+    source  = tools::file_path_sans_ext(basename(.x))
+  )
+})
+
+
+blink_files <- list.files(
+  blink_path,
+  pattern = "\\.npy$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+blinks <- map_dfr(blink_files, function(x){
+
+  arr <- np$load(x, allow_pickle = TRUE)
+  vec <- as.logical(unlist(py_to_r(arr)))
+
+  tibble(
+    source = tools::file_path_sans_ext(basename(x)),
+    frame  = seq_along(vec),
+    blink  = vec
+  )
+})
+
+# -------------------------------------------------------
+# 3) LOAD CAMERA DELAY (first TTL)
+# -------------------------------------------------------
+
+
+
+
+cam_delay <- read_csv_folder(CamDelay_path)
+
+
+# -------------------------------------------------------
+# 4) ADD FRAME NUMBER + ABSOLUTE TIME TO PUPILS
+# -------------------------------------------------------
+
+pupils <- pupils %>%
+  left_join(cam_delay, by = "source")  %>% 
+  group_by(source) %>%
+  mutate(
+    frame = row_number() ,
+    time = ((frame-1) / 25) + camttl      # camera runs at 25 Hz
+  ) %>% na.omit() %>% ungroup() %>%  left_join(blinks) %>% mutate(pupil = ifelse(blink ==F,pupil,NA))
+
+
+
+
+
+
+
+pre <- -90
+post <- 50
+
+
+#### 1
+
+# 2. Join and Filter in one pipeline
+df_segments <- pupils %>%
+  # Join everything by source first
+  inner_join(sound_starts, by = "source", relationship = "many-to-many") %>%
+  # Keep only pupil timepoints that fall within the trial window
+  filter(time >= (continuous_start + pre), 
+         time <= (continuous_start + post)) %>%
+  # Calculate relative metrics
+  mutate(
+    time_relative = time - continuous_start,
+    # Align to 25Hz bins (optional, but keeps your original logic)
+    time_bin = (1/25) * floor(time_relative / (1/25))
+  ) %>%
+  # Clean up column names if needed
+  rename(stim_id = trial_type)
+
+
+
+
+df_segments <-  df_segments %>% 
+  group_by(source) %>% 
+  mutate(
+    maxP = quantile(pupil, na.rm = TRUE, 0.99), 
+    minP = quantile(pupil, na.rm = TRUE, 0.01),
+    pupil = ifelse(pupil > maxP, maxP, pupil),
+    pupil = ifelse(pupil < minP, minP, pupil)
+  ) %>% 
+  ungroup() %>%   mutate(trial_sequence = as.numeric(trial_number))
+
+
+df_segments <- add_baseline_zscore(
+  data = df_segments,
+  value_column = "pupil",
+  group_columns = c("source", "trial_number"),
+  time_column = "time_bin",
+  baseline_end = -1,
+  zscore_column = "pz"
+) %>%
+  filter(Animal %in% Animal_list)
+
+res2_pupil <- df_segments %>%
+  add_fear_labels(shock) %>%
+  filter(Opto == "no") %>%
+  group_by(Animal, condition, fear) %>%
+  mutate(trial_rank = dense_rank(trial_sequence)) %>%
+  ungroup()
+res2_pupil
+
+res2_pupil %>% distinct(Animal,source)
+```
+
+
+# over trials
+```{r}
+
+
+ 
+ 
+df_segments%>% left_join(shock) %>% mutate(fear = ifelse(direction == stringr::str_remove(stim_id, "^Opto_"),'cs+',"cs-")) %>% 
+  mutate(Opto = ifelse(str_starts(stim_id, 'Opto'), 'opto', 'no')) %>% ungroup %>%  distinct(Opto,stim_id)
+ 
+
+
+
+# in the cs+ condition, it looks like later trials ( lighter colors) have higher responses
+
+res2 %>% filter(between(time_bin,-0.1,5.15)) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  
+  group_by(Animal, condition,fear) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>% 
+  
+  group_by(trial_rank, time_bin,fear) %>% 
+  summarise(mz = mean(pz), .groups = "drop") %>% 
+  
+  ggplot(aes(time_bin, mz, group = trial_rank, col = trial_rank)) +
+  geom_line()+
+  facet_wrap(~fear)
+
+
+res2 %>% filter(between(time_bin,1,5))%>%  
+  group_by(trial_rank, fear,condition) %>% 
+  summarise(mz = mean(pz), .groups = "drop") %>% ggplot()+
+    facet_grid(condition ~ fear)+
+   geom_point(aes(as.factor(trial_rank),mz))+
+   geom_smooth(aes(trial_rank,mz), method =  'lm')
+
+res2 %>% filter(fear == 'cs-', condition == "recall", trial_rank == 9) %>% ggplot(aes(time_relative))
+
+
+
+res2 %>% filter(between(time_bin,0.25,1), fear == "cs+") %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  
+  group_by(Animal, condition,fear) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>% 
+  
+  group_by(trial_rank, time_bin,fear) %>% 
+  summarise(mz = mean(pz), .groups = "drop") %>% 
+  
+  ggplot(aes(time_bin, mz, group = trial_rank, col = trial_rank)) +
+  geom_smooth(span=0.3,se=F)+
+  geom_line(alpha=0.5)
+
+
+
+res2 %>% filter(between(time_bin,0.2,0.8), fear == "cs+") %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  
+  group_by(Animal, condition,fear) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>% 
+  
+  group_by(trial_rank, time_bin,fear) %>% 
+  summarise(mz = mean(pz), .groups = "drop") %>% left_join( {.} %>% group_by(trial_rank) %>% slice_min(time_bin) %>% mutate(fv = mz) %>% select(fv, trial_rank)) %>% mutate(mz = mz - fv) %>% 
+   ggplot(aes(time_bin, mz, group = trial_rank, col = trial_rank)) +
+  geom_smooth(span=0.3,se=F)+
+  geom_line(alpha=0.5)
+
+```
+
+
+```{r}
+
+ 
+ 
+ 
+ 
+ 
+  slope_mean =  res2 %>% 
+  group_by(Animal,trial_rank, fear,condition) %>% 
+  summarise(mz = mean(pz), .groups = "drop")
+ 
+ 
+ 
+ slope_mean %>% group_by(Animal,condition,fear) %>% arrange(trial_rank) %>% mutate(change = mz - lag(mz)) %>% ungroup() %>% mutate(trial_rank_cat = ifelse(trial_rank >5, 'late','early')) %>% na.omit() %>% summarise(change = mean(change), .by=c(trial_rank,trial_rank_cat,Animal,condition,fear)) %>%  ggplot(aes(trial_rank_cat,change))+
+   geom_boxplot()+
+   facet_grid(condition ~ fear)
+ 
+ slope_mean %>% group_by(Animal,condition,fear) %>% arrange(trial_rank) %>% mutate(change = mz - lag(mz)) %>% ungroup() %>% mutate(trial_rank_cat = ifelse(trial_rank >6, 'late','early')) %>% na.omit()%>% group_by(condition,fear,trial_rank_cat) %>% summarise(change = mean(change)) %>% ggplot(aes(trial_rank_cat,change))+
+   geom_point()+
+    facet_grid(condition ~ fear)
+ 
+ 
+ 
+
+ 
+ 
+ df_segments %>% group_by(source) %>% distinct(trial_number) %>% group_by(source) %>% count(source)
+  res2 %>% group_by(source) %>% distinct(trial_number) %>% group_by(source) %>% count(source)
+  
+
+lines <- res2 %>%  filter(between(time_bin,-0.5,5))  %>%   
+  group_by(trial_rank, fear,condition) %>% 
+  summarise(mz = mean(pz), .groups = "drop") 
+
+
+res2   %>%  filter(between(time_bin,-0.5,5)) %>%   
+  group_by(trial_rank, fear,condition,time_bin) %>% 
+  summarise(mz = mean(pz), .groups = "drop") %>% ggplot(aes(time_bin,mz, col = trial_rank,group= trial_rank))+
+  geom_line()+
+  facet_grid(condition ~ fear)+
+  geom_hline(data = lines, aes(yintercept = mz, col = trial_rank))+
+  theme_classic()
+
+
+
+res2 %>% filter(fear == "cs+",condition=='recall') %>%  filter(between(time_bin,-25.5,25)) %>%   
+  group_by(trial_rank,time_bin) %>% 
+  summarise(mz = mean(pz), .groups = "drop") %>% ggplot(aes(time_bin,mz, col = trial_rank,group= trial_rank))+
+  geom_line()+
+  geom_hline(data = lines, aes(yintercept = mz, col = trial_rank))+
+  theme_classic()
+
+df_segments
+pupils
+
+
+df_segments %>% filter(time_bin < -1) %>% group_by(source) %>% summarise(mean = mean(pupil), sd = sd(pupil))
+
+
+
+
+
+
+res2 <- df_segments%>% left_join(shock) %>% mutate(fear = ifelse(direction == stringr::str_remove(stim_id, "^Opto_"),'cs+',"cs-")) %>% 
+  mutate(Opto = ifelse(str_starts(stim_id, 'Opto'), 'opto', 'no')) %>% 
+  filter(Opto == "no") %>%  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>% 
+  ungroup() 
+
+res2 %>% filter(fear == "cs+",condition=='recall') %>%  filter(between(time_bin,-25.5,25)) %>%   
+  group_by(trial_rank,time_bin) %>% 
+  summarise(mz = mean(pz), .groups = "drop") %>% ggplot(aes(time_bin,mz, col = trial_rank,group= trial_rank))+
+  geom_line()+
+  geom_hline(data = lines, aes(yintercept = mz, col = trial_rank))+
+  theme_classic()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+res2 %>% filter(condition=='recall', Animal == '8273') %>%  filter(between(time_bin,-5,5)) %>%   
+  group_by(time_bin,trial_sequence) %>% 
+  summarise(mz = mean(pz), .groups = "drop") %>% ggplot(aes(time_bin,mz))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~trial_sequence,scales='free')
+
+
+res2 %>% filter(condition=='recall', Animal == '8273') %>%  filter(between(time_bin,-5,-0.1)) %>%   
+  group_by(trial_rank) %>% summarise(round(mean(pz),2))
+
+
+res2 %>% filter(condition=='recall', Animal == '8273') %>% distinct(trial_sequence)
+
+data %>% filter(source == "8273_recall") %>% filter(trial_number == 31) %>% mutate(videotime =  continuous_start-47.752750	)
+cam_delay
+
+
+res2   %>%  filter(between(time_bin,-0.5,5)) %>%   
+  group_by(trial_rank, fear,condition,time_bin) %>% 
+  summarise(mz = mean(pz), .groups = "drop") %>% ggplot(aes(time_bin,mz, col = trial_rank,group= trial_rank))+
+  geom_line()+
+  facet_grid(condition ~ fear)+
+  geom_hline(data = lines, aes(yintercept = mz, col = trial_rank))+
+  theme_classic()
+
+
+res2   %>%  filter(between(time_bin,-0.5,5)) %>% filter_out(fear == 'cs-'& condition == 'recall'&trial_rank == 3) %>% 
+  group_by(trial_rank, fear,condition,time_bin) %>% 
+  summarise(mz = mean(pz), .groups = "drop") %>% ggplot(aes(time_bin,mz, col = trial_rank,group= trial_rank))+
+  geom_line()+
+  facet_grid(condition ~ fear)+
+  geom_hline(data = lines, aes(yintercept = mz, col = trial_rank))+
+  theme_classic()
+
+
+
+
+
+
+res2 %>% filter(fear == "cs+",condition=='recall') %>%  filter(between(time_bin,-1,6)) %>%   
+  group_by(trial_rank,time_bin,Animal) %>% 
+  summarise(mz = mean(pupil), .groups = "drop") %>% ggplot(aes(time_bin,mz, col = trial_rank,group= trial_rank))+
+  geom_line()+
+  facet_wrap( ~ Animal,scales = "free")+
+  theme_classic()
+
+
+
+res2 %>% filter(source== "8155_recall", trial_number > 40, between(time_bin,-1,6)) %>% ggplot(aes(time_bin,pz,group=trial_number,col = trial_number))+
+  geom_line()
+
+res2 %>% filter(source== "8155_recall", trial_number > 1, between(time_bin,-1,6)) 
+
+res2 %>% filter(source== "8155_recall", between(time_bin,0,6)) %>% group_by(trial_number) %>% slice_min(frame)
+
+pupils %>% filter(source== "8155_recall", frame > 11474, frame < 16252 + 6*25	) %>% ggplot(aes(frame,pupil))+
+  geom_line()+
+  geom_vline(xintercept = c(11474, 11474 + 6*25, 13875	,13875+6*25 ,16252,16252+ 6*25	))
+
+
+
+pupils %>% filter(source== "8155_recall", frame > 16252 - 25, frame < 16252 + 6*25	) %>% ggplot(aes(frame,pupil))+
+  geom_line()+
+  geom_vline(xintercept = c(16252,16252+ 6*25	))
+
+
+pppupil <- res2_pupil %>% group_by(source,trial_number) %>%  summarise(
+    pre = mean(pz[time_bin >= -1 & time_bin < 0], na.rm = TRUE),
+    a0 = mean(pz[time_bin >= -0.1 & time_bin < 0.1], na.rm = TRUE),
+    post  = mean(pz[time_bin >= 1 & time_bin <= 1.5], na.rm = TRUE),
+    .groups = "drop"
+  ) 
+
+pppupil %>% pivot_longer(cols= pre:post, names_to = "var", values_to = "val" )%>% na.omit() %>%  ggplot(aes(var,val))+
+  geom_boxplot()+
+  coord_cartesian(ylim=c(-1,3))
+
+
+pppupil <- res2_pupil %>% group_by(source,trial_number) %>%  summarise(
+    pre = mean(pz[time_bin >= -1 & time_bin < 0], na.rm = TRUE),
+    a0 = mean(pz[time_bin >= -0.1 & time_bin < 0.1], na.rm = TRUE),
+    post  = mean(pz[time_bin >= 1 & time_bin <= 1.5], na.rm = TRUE),
+    .groups = "drop"
+  ) 
+
+pppupil <- res2_pupil %>% group_by(source,trial_number,fear) %>%  summarise(
+    pre = mean(pupil[time_bin >= -1 & time_bin < 0], na.rm = TRUE),
+    a0 = mean(pupil[time_bin >= -0.1 & time_bin < 0.1], na.rm = TRUE),
+    post  = mean(pupil[time_bin >= 1.5 & time_bin <= 2], na.rm = TRUE),
+    .groups = "drop"
+  ) 
+
+pppupil %>% 
+  ggplot(aes(pre, post)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0)
+
+
+pppupil %>% mutate(pc = post-pre)  %>%   ggplot(aes(pre,pc))+
+  geom_point()+
+  geom_smooth(method='lm')
+```
+# cs+ vs cs-
+```{r}
+
+
+res2_pupil %>% filter(condition == "recall") %>% filter(between(time_bin,-2,10)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(fear,time_bin)) %>% ggplot(aes(time_bin, mz,col=fear))+
+  geom_line()+
+  theme_classic()
+
+res2_pupil %>% filter(between(time_bin,-2,10)) %>%  filter(Animal %in% Animal_list)%>% na.omit() %>% summarise(mz = mean(pz), .by = c(fear,time_bin)) %>% ggplot(aes(time_bin, mz,col=fear))+
+  geom_line()+
+  theme_classic()
+
+Animal_list
+
+
+
+res2_pupil %>% filter(condition == "recall") %>% filter(between(time_bin,-2,10)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(fear,time_bin,direction)) %>% ggplot(aes(time_bin, mz,col=fear))+
+  geom_line()+
+  theme_classic()+
+  facet_grid(~direction)
+
+res2 %>% filter(condition == "recall") %>% filter(between(time_bin,-2,10)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(fear,time_bin,stim_id)) %>% ggplot(aes(time_bin, mz,col=fear))+
+  geom_line()+
+  theme_classic()+
+  facet_grid(~stim_id)
+
+
+res2 %>% filter(condition == "recall") %>% filter(between(time_bin,-2,10)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(fear,time_bin,direction)) 
+
+
+
+
+res2 %>% filter(condition == "recall") %>% filter(between(time_bin,-2,10)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(Animal,fear,time_bin)) %>% ggplot(aes(time_bin, mz,col=fear))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~Animal,scales="free")
+
+
+
+res2 %>% filter(condition == "recall") %>% filter(between(time_bin,0,5)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(fear,time_bin)) %>% ggplot(aes(time_bin, mz,col=fear))+
+  geom_line()+
+  geom_vline(data = tibble(time_bin = seq(0,5,1)),aes(xintercept=time_bin))
+  theme_classic()
+
+```
+
+# Up vs Down
+```{r}
+res2 %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(stim_id,time_bin,condition)) %>% ggplot(aes(time_bin, mz,col=stim_id))+
+  geom_line()+
+  theme_classic()
+```
+
+#fear and direction
+```{r}
+
+res2 %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(stim_id,time_bin,fear)) %>% ggplot(aes(time_bin, mz,col=stim_id))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~fear)
+
+
+res2_pupil %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% filter(fear =='cs+') %>% summarise(mz = mean(pz), .by = c(stim_id,time_bin,condition)) %>% ggplot(aes(time_bin, mz,col=stim_id))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~condition)
+
+
+res2_pupil %>% filter(between(time_bin,-2,6)) %>% na.omit()  %>% summarise(mz = mean(pz), .by = c(fear,stim_id,time_bin,condition)) %>% ggplot(aes(time_bin, mz,col=stim_id))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(fear~condition)
+                          
+                              
+
+#avg diff
+
+res2_pupil %>% filter(between(time_bin,-2,6)) %>% na.omit()  %>% summarise(mz = mean(pz), .by = c(stim_id,time_bin,condition,fear)) %>% pivot_wider(names_from = condition,values_from = mz) %>% mutate(diff = recall-naive) %>% ggplot(aes(time_bin,diff,col=stim_id))+
+  geom_line()+
+  facet_wrap(~fear)
+
+# per Animal diff
+res2_pupil %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(stim_id,time_bin,condition,Animal,fear))  %>% pivot_wider(names_from = condition,values_from = mz)  %>% mutate(diff = recall-naive)  %>% na.omit() %>% summarise(diff = mean(diff), .by = c(stim_id,time_bin,fear)) %>% ggplot(aes(time_bin,diff,col=stim_id))+
+  geom_line()+
+  facet_wrap(~fear)
+
+
+res2_pupil %>% filter(condition=="recall")  %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(fear,stim_id,time_bin,Animal)) %>% ggplot(aes(time_bin,mz, col=stim_id))+
+  geom_line()+
+  facet_grid(fear~Animal)
+
+```
+
+
+# Animal
+
+```{r}
+
+res2_pupil %>% filter(between(time_bin,-1,6)) %>% filter(source=='8104_recall') %>% filter(trial_number<15) %>%  na.omit() %>% summarise(mz = mean(pz), .by = c(trial_number,time_bin))%>% ggplot(aes(time_bin, mz,col=as.factor(trial_number)))+
+  geom_smooth(span=0.05,se=F)+
+  theme_classic()
+
+
+res2_pupil %>% filter(between(time_bin,-10,6)) %>% filter(source=='8104_recall') %>% filter(trial_number<50) %>%  na.omit() %>% summarise(mz = mean(pupil), .by = c(time_bin))%>% ggplot(aes(time_bin, mz))+
+  geom_smooth(span=0.05,se=F)+
+  theme_classic()
+
+
+res2_pupil %>% filter(between(time_bin,-4,6)) %>% na.omit() %>% filter(condition=="recall")%>% summarise(mz = mean(pupil), .by = c(source,time_bin))%>% ggplot(aes(time_bin, mz,col=source))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~source,scales = 'free')
+
+res2_pupil %>% distinct(Animal,source)
+
+res2_speed %>% filter(between(time_bin,-2,0)) %>% group_by(source) %>% summarise(mean= mean(speed), sum= sum(speed))
+```
+
+# naive Vs recall
+```{r}
+
+
+res2 %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(time_bin,condition)) %>% ggplot(aes(time_bin, mz,col=condition))+
+  geom_line()+
+  theme_classic()
+
+```
+# fear and condition
+
+```{r}
+
+res2 %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(fear,time_bin,condition)) %>% ggplot(aes(time_bin, mz,col=condition))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~fear)
+```
+# Opto
+
+```{r}
+ res3 <- df_segments%>% left_join(shock) %>% mutate(fear = ifelse(direction == stringr::str_remove(stim_id, "^Opto_"),'cs+',"cs-")) %>% 
+  mutate(Opto = ifelse(str_starts(stim_id, 'Opto'), 'opto', 'no')) %>% 
+  mutate(trial_sequence = as.numeric(trial_number)) %>% 
+  group_by(Animal, condition,fear)  %>%  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  ungroup() 
+
+
+res3 %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(time_bin,Opto)) %>% ggplot(aes(time_bin, mz,col=Opto))+
+  geom_line()+
+  theme_classic()
+```
+
+
+
+```{r}
+ res3 <- df_segments%>% left_join(shock) %>% mutate(fear = ifelse(direction == stringr::str_remove(stim_id, "^Opto_"),'cs+',"cs-")) %>% 
+  mutate(Opto = ifelse(str_starts(stim_id, 'Opto'), 'opto', 'no')) %>% 
+  mutate(trial_sequence = as.numeric(trial_number)) %>% 
+  group_by(Animal, condition,fear)  %>%  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  ungroup() 
+
+
+res3 %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(time_bin,stim_id)) %>% ggplot(aes(time_bin, mz,col=stim_id))+
+  geom_line()+
+  theme_classic()
+
+res3 %>% filter(between(time_bin,0,1)) %>% distinct(time_bin)
+```
+
+```{r}
+
+
+combined <- res2_speed %>%
+  filter(between(time_bin, -10, 10)) %>%
+  select(source, Animal, trial_number, stim_id, speed, time_bin, sz,fear,condition) %>%
+  group_by(source, Animal, trial_number) %>%
+  group_modify(~ {
+    
+    pupil_trial <- res2_pupil %>%
+      filter(
+        between(time_bin, -10, 10),
+        source == .y$source,
+        Animal == .y$Animal,
+        trial_number == .y$trial_number
+      ) %>%
+      select(time_bin, pupil, pz) %>%
+      arrange(time_bin)
+    
+    interp_to_grid <- function(values, source_time, target_time) {
+      ok <- !is.na(source_time) & !is.na(values)
+      
+      if (sum(ok) < 2) {
+        return(rep(NA_real_, length(target_time)))
+      }
+      
+      approx(
+        x = source_time[ok],
+        y = values[ok],
+        xout = target_time,
+        rule = 1   # keeps times outside the recorded pupil range as NA
+      )$y
+    }
+    
+    .x %>%
+      arrange(time_bin) %>%
+      mutate(
+        pupil = interp_to_grid(
+          values = pupil_trial$pupil,
+          source_time = pupil_trial$time_bin,
+          target_time = time_bin
+        ),
+        pz = interp_to_grid(
+          values = pupil_trial$pz,
+          source_time = pupil_trial$time_bin,
+          target_time = time_bin
+        )
+      )
+  }) %>%
+  ungroup()
+
+
+
+
+
+combined %>% filter(stim_id %in% c("Downsweep","Upsweep"))%>% filter(condition == "recall") %>% filter(between(time_bin,-1,6)) %>% 
+  group_by(time_bin) %>%
+  summarise(
+    n = sum(complete.cases(speed, pupil)),
+    correlation = cor(speed, pupil, use = "complete.obs"),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 3) %>% ggplot(aes(time_bin, correlation)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_line(linewidth = 0.8) +
+  labs(
+    x = "Time",
+    y = "Pearson correlation (speed vs pupil)",
+    colour = "Fear"
+  ) +
+  theme_classic()
+
+
+
+combined %>% filter(stim_id %in% c("Downsweep","Upsweep")) %>% filter(condition == "recall") %>% filter(between(time_bin,-1,6)) %>% 
+  group_by(time_bin,fear,stim_id) %>%
+  summarise(
+    n = sum(complete.cases(speed, pupil)),
+    correlation = cor(speed, pupil, use = "complete.obs"),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 3) %>% ggplot(aes(time_bin, correlation,col=fear)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_line(linewidth = 0.8) +
+  labs(
+    x = "Time",
+    y = "Pearson correlation (speed vs pupil)",
+    colour = "Fear"
+  ) +
+  theme_classic()+
+  facet_wrap(~stim_id)
+
+
+
+moddat <- combined %>%
+  filter(
+    stim_id == "Upsweep",
+    condition == "recall",
+    fear == "cs+",
+    between(time_bin, -1, 2)
+  ) %>%
+  na.omit() %>%
+  filter(speed <= quantile(sz, 0.95)) %>%
+  mutate(time_bin = factor(time_bin))
+
+mod <- lm(pupil ~ speed * time_bin, data = moddat)
+
+plot(mod)
+
+
+speed_vals <- seq(
+  min(moddat$sz),
+  max(moddat$sz),
+  length.out = 3
+)
+
+pred <- expand.grid(
+  time_bin = levels(moddat$time_bin),
+  speed = speed_vals
+)
+
+pred$time_bin_num <- as.numeric(as.character(pred$time_bin))
+pred$fit <- predict(mod, newdata = pred)
+
+ggplot(pred, aes(time_bin_num, fit, color = as.factor(speed), group = as.factor(speed))) +
+  geom_line()
+  scale_x_continuous(
+    breaks = seq(-1, 6, 1)
+  ) +
+  labs(
+    x = "Time (s)",
+    y = "Predicted pupil",
+    color = "Speed"
+  )
+
+
+
+speed_breaks <- seq(
+  min(moddat$sz, na.rm = TRUE),
+  quantile(moddat$sz, 0.95, na.rm = TRUE),
+  length.out = 4
+)
+
+rawdat <- moddat %>%
+  filter(sz <= quantile(sz, 0.95, na.rm = TRUE)) %>%
+  mutate(
+    speed_cat = cut(
+      sz,
+      breaks = speed_breaks,
+      include.lowest = TRUE,
+      labels = paste0("Speed ", 1:3)
+    )
+  ) %>% na.omit()
+
+
+rawdat %>% summarise(pupil= mean(pupil),.by =c(time_bin,speed_cat)) %>% 
+ggplot( aes(
+  x = as.numeric(as.character(time_bin)),
+  y = pupil, col= speed_cat
+)) +
+  geom_smooth(method="loess",span=0.1)+
+  theme_classic()
+
+
+
+
+
+
+rawdat <- combined %>%
+  filter(
+    stim_id == "Upsweep",
+    condition == "recall",
+    fear == "cs+",
+    between(time_bin, -1, 6)
+  ) %>%
+  na.omit() %>%
+  mutate(time_bin = factor(time_bin)) %>%
+  filter(sz <= quantile(sz, 0.95, na.rm = TRUE))
+
+
+speed_breaks <- quantile(
+  rawdat$speed,
+  probs = c(0,0.5,0.75,0.95,1),
+  na.rm = TRUE
+)
+
+rawdat <-rawdat %>% 
+  mutate(
+    speed_cat = cut(
+      speed,
+      breaks = speed_breaks,
+      include.lowest = TRUE
+    )
+  )
+
+rawdat %>% summarise(pupil= mean(pupil),.by =c(time_bin,speed_cat)) %>% 
+ggplot( aes(
+  x = as.numeric(as.character(time_bin)),
+  y = pupil, col= speed_cat
+)) +
+  geom_smooth(method="loess",span=0.1)+
+  theme_classic()
+```
+```
+

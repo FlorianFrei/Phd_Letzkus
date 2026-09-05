@@ -1,0 +1,1358 @@
+---
+title: "speed_analysis"
+format: html
+editor: visual
+---
+```{r}
+library(arrow)
+library(data.table)
+library(purrr)
+library(fs)
+library(tidyverse)
+source("C:/Users/Freitag/Documents/GitHub/Phd_Letzkus/analysis/general/data_helpers.R")
+Animal_list <- c("8103","8104","8155","8181","8182","8186","8251","8252","8272","8273")
+exclusion_list <- c("8103_naive")
+
+speed_folder <- "I:/Data/aligned/all_good/Behv/Speeds"
+BPOD_path <- "I:/Data/aligned/all_good/Behv/BPOD"
+
+sound_starts <- load_sound_starts(BPOD_path)
+shock <- load_shock_direction("I:/Data/aligned/extra/Shock_direction.csv")
+
+```
+
+
+```{r}
+# 1. Grab all CSV file paths
+csv_files <- fs::dir_ls(speed_folder, glob = "*.csv")
+
+# 2. Process each file with data.table speed
+speed_binned_list <- csv_files %>% 
+  map(function(file_path) {
+    
+    # Extract the file name statically
+    file_name <- fs::path_ext_remove(fs::path_file(file_path))
+    
+    # Open dataset and collect directly into a data.table
+    dt <- as.data.table(open_dataset(file_path, format = "csv") %>% collect())
+    
+    # Calculate the 10ms bins and aggregate down instantly
+    # data.table handles this entirely in optimized C memory
+    binned_dt <- dt[, .(
+      speed = mean(speed),
+      direction = round(mean(direction))
+    ), by = .(time_ms = floor(time_ms / 10) * 10)]
+    
+    # Add the source file name identifier
+    binned_dt[, source := file_name]
+    
+    return(binned_dt)
+  })
+
+# 3. Efficiently bind all datasets together and sort
+speed_binned <- rbindlist(speed_binned_list)
+setorder(speed_binned, source, time_ms)
+
+# (Optional) Convert back to a standard tibble/dataframe if you prefer working with dplyr later
+speed_binned <- as_tibble(speed_binned)
+
+
+
+
+
+speed_binned <- speed_binned %>% mutate(time_ms = time_ms/1000)
+pre <- -20
+post <- 20
+
+library(data.table)
+
+# 1. Convert to data.table
+setDT(speed_binned)
+setDT(sound_starts)
+
+# 2. Define the explicit windows inside sound_starts
+sound_starts[, `:=`(
+  window_start = continuous_start + pre,
+  window_end   = continuous_start + post
+)]
+
+# 3. Perform a non-equi join
+# This looks for matches where speed_raw$sample falls between window_start and window_end
+df_segments <- sound_starts[
+  speed_binned, 
+  on = .(source, window_start <= time_ms, window_end >= time_ms),
+  nomatch = NULL, # Acts like an inner_join
+  allow.cartesian = TRUE
+]
+
+# 4. Post-join cleanup and relative time calculation
+# Note: data.table renames the join columns to the target names, so window_start is actually your original 'sample'
+df_segments[, `:=`(
+  time_relative = window_start - continuous_start,
+  stim_id = trial_type
+)]
+
+# Clean up the artificial window columns if you don't need them
+df_segments[, c("window_start", "window_end") := NULL]
+
+# Convert to tibble and clean
+df <- as_tibble(df_segments) %>%
+  filter(Animal %in% Animal_list) %>%
+  mutate(
+    rel_time = round(time_relative, 2),
+    speed_raw = speed,
+    speed = abs(speed)
+  ) %>%
+  select(-time_relative)
+
+# Per-trial baseline Z-score:
+# baseline is every timepoint before -1 s,
+# calculated independently for each source and trial.
+df <- add_baseline_zscore(
+  data = df,
+  value_column = "speed",
+  group_columns = c("source"),
+  time_column = "rel_time",
+  baseline_end = -1,
+  zscore_column = "sz"
+)
+
+# Add shock-direction, fear, and optogenetic labels
+res2_speed <- df %>% mutate(speed_direction = direction) %>% 
+  select(-any_of("direction")) %>%
+  left_join(shock, by = "Animal") %>%
+  mutate(
+    fear = if_else(
+      direction == str_remove(stim_id, "^Opto_"),
+      "cs+",
+      "cs-"
+    ),
+    Opto = if_else(
+      str_starts(stim_id, "Opto"),
+      "opto",
+      "no"
+    ),
+    time_bin = rel_time
+  ) %>% filter(stim_id %in% c("Downsweep","Upsweep")) %>% filter_out(source %in% exclusion_list)
+ 
+ res2_speed_raw <- df %>%
+  select(-any_of("direction")) %>%
+  left_join(shock, by = "Animal") %>%
+  mutate(
+    fear = if_else(
+      direction == str_remove(stim_id, "^Opto_"),
+      "cs+",
+      "cs-"
+    ),
+    Opto = if_else(
+      str_starts(stim_id, "Opto"),
+      "opto",
+      "no"
+    ),
+    time_bin = rel_time
+  ) 
+ 
+
+speed_binned %>% distinct(source)
+
+
+speed_binned %>%
+  filter(source == "8181_naive") %>%
+  summarise(min_time = min(time_ms), max_time = max(time_ms))
+
+sound_starts %>%
+  filter(source == "8181_naive") %>%
+  select(source, continuous_start, trial_number) %>% arrange(continuous_start)
+
+```
+
+```{r}
+audio <- fread("I:/Data/raw/8181/8181_recall/Meta/Audio.csv")
+
+audio_rise <- audio[edge_type == "rising", timestamps]
+
+sound_starts %>%
+  filter(source == "8181_recall") %>%
+  transmute(
+    continuous_start,
+    nearest_audio_ttl = audio_rise[
+      max.col(-abs(outer(continuous_start, audio_rise, "-")), ties.method = "first")
+    ],
+    offset_s = nearest_audio_ttl - continuous_start
+  )
+
+test <- sound_starts[source == "8181_recall",
+  .(trial_id = .I, continuous_start)]
+
+audio_dt <- data.table(
+  audio_time = audio[edge_type == "rising", timestamps]
+)
+setkey(audio_dt, audio_time)
+
+test[, nearest_audio := audio_dt[.SD, on = .(audio_time = continuous_start),
+                                 roll = "nearest", x.audio_time]]
+test[, offset_s := nearest_audio - continuous_start]
+summary(test$offset_s)
+
+
+test %>% ggplot(aes(trial_id,offset_s))+
+  geom_point()+
+  ylim(-1,1)
+
+
+sound_starts %>%
+  filter(source == "8181_naive") %>% mutate(ss = audio_rise)
+
+audio
+
+
+test %>% filter(abs(offset_s) >1)
+```
+
+
+```{r}
+df %>% filter(between(rel_time,0,5)) %>% filter(condition=="recall") %>% summarise(ms = mean(speed), .by=c(rel_time)) %>% ggplot(aes(rel_time,ms))+
+  geom_line()
+
+
+speed_binned %>% filter(source == "8155_recall") %>% ggplot(aes(time_ms, speed))+
+  geom_line()
+```
+
+
+
+```{r}
+
+
+
+
+
+df %>% filter(between(time_relative,-1,5))  %>% mutate(time_relative = round(time_relative,1)) %>% group_by(Animal,condition) %>%  mutate(zs = (speed - mean(speed))/sd(speed)) %>%  ungroup() %>%  summarise(ms = mean(abs(speed)), .by = c(time_relative,source)) %>% ggplot(aes(time_relative,ms))+
+  geom_line()+
+  facet_wrap(~source,scales='free')
+
+
+df %>% filter(source=='17_naive')%>% filter(between(time_relative,-1,6))  %>% mutate(time_relative = round(time_relative,1)) %>% mutate(speed = abs(speed))  %>% 
+  group_by(time_relative)  %>% summarise(speed = mean(speed)) %>%   ggplot(aes(time_relative,speed))+
+  geom_line()+
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()
+
+speed_raw2
+
+df
+
+speed_binned %>% filter(between(time_ms,0,1)) %>%  distinct(time_ms) %>% pull(time_ms)
+
+
+
+df %>%   ggplot(aes(time_relative,speed))+
+  geom_smooth()+
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()
+
+df
+
+df %>% mutate(time_relative = round(time_relative,2)) %>% 
+  group_by(time_relative)  %>% summarise(speed = mean(speed))  %>%   ggplot(aes(time_relative,speed))+
+  geom_line()+
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()+
+  xlim(-1,6)
+
+  
+speed_binned %>% filter(source=='17_recall') %>% ggplot(aes(time_ms,speed))+
+  geom_line()+
+  xlim(500,1000)
+
+
+
+speed17 <- read_csv("I:/Data/aligned/new/binfree/extra/Speed/17_recall.csv")
+
+
+speed17 %>%  filter(between(time_ms,550000,700000)) %>% ggplot(aes(time_ms,speed))+
+  geom_line()
+
+
+speed17 %>% ggplot(aes(time_ms))+
+  geom_histogram()
+
+
+```
+
+```{r}
+df <- df %>% mutate(time_relative = rel_time) 
+
+shock <- read_csv(r"(I:\Data\aligned\extra\Shock_direction.csv)") %>% select(Animal = Animal2, direction) %>% mutate(direction = paste0(direction,"sweep"))   %>% mutate(Animal = as.character(Animal))
+
+
+# 1. Calculate baselines safely
+baselines <- df %>% 
+  group_by(source) %>% 
+  filter(between(time_relative,-5,-0.1)) %>% mutate(speed = abs(speed)) %>% 
+  summarise(
+    base_mean = mean(speed, na.rm = TRUE), 
+    base_sd = sd(speed, na.rm = TRUE),
+    .groups = "drop" # Cleanly ungroups for future joins
+  ) %>% 
+  # If sd is exactly 0 (complete freezing), turn it into NA to prevent Inf values
+  mutate(base_sd = ifelse(base_sd == 0, NA_real_, base_sd))
+
+# 2. Join and calculate Z-scores explicitly
+res2_speed <- df %>% 
+  select(!direction) %>% 
+  left_join(shock, by = "Animal") %>% # Explicit join key assumed here
+  mutate(
+    fear = ifelse(direction == stringr::str_remove(stim_id, "^Opto_"), 'cs+', 'cs-'),
+    Opto = ifelse(str_starts(stim_id, 'Opto'), 'opto', 'no'),
+    time_bin = time_relative
+  ) %>%   mutate(speed = abs(speed)) %>% 
+  # Explicitly map the baseline values to the matching source & trial
+  left_join(baselines) %>%
+  mutate(pz = (speed - base_mean) / base_sd)
+ 
+ 
+ res2 %>% filter(between(time_relative,-2,6))  %>% summarise(mz = mean(speed), .by = c(time_bin)) %>% ggplot(aes(time_bin, mz))+
+  geom_line()+
+  theme_classic()
+ 
+ 
+ 
+ 
+ df %>% ungroup() %>% filter(between(time_relative,-2,6))  %>% 
+  group_by(time_relative)  %>% summarise(speed = mean(speed))  %>%   ggplot(aes(time_relative,speed))+
+  geom_line()
+  geom_vline(aes(xintercept=0), linetype = 'dashed',col='red')+
+  theme_minimal()
+
+ 
+  
+  # Synchronized Plot 1
+res2 %>% 
+  filter(between(time_relative, -2, 6)) %>% 
+  summarise(speed = mean(speed), .by = time_bin) %>% # Standardized variable name
+  ggplot(aes(time_bin, speed)) +
+  geom_line() +
+  theme_classic()
+
+# Synchronized Plot 2
+df %>% 
+  filter(between(time_relative, -2, 6)) %>% 
+  summarise(speed = mean(speed), .by = time_relative) %>% # Used .by for matching logic
+  ggplot(aes(time_relative, speed)) +
+  geom_line() +
+  geom_vline(aes(xintercept = 0), linetype = 'dashed', col = 'red') + # Fixed missing +
+  theme_minimal()
+
+
+res2 %>% 
+  filter(between(time_relative, -2, 6)) %>% 
+  summarise(speed = mean(speed), .by = time_relative) %>% # Used .by for matching logic
+  ggplot(aes(time_relative, speed)) +
+  geom_line() +
+  geom_vline(aes(xintercept = 0), linetype = 'dashed', col = 'red') + # Fixed missing +
+  theme_minimal()
+ 
+ 
+ baselines
+ 
+ 
+ baselines %>% mutate(base_mean = round(base_mean,2))
+```
+
+
+
+# cs+ vs cs-
+```{r}
+
+res2 %>% filter(is.na(pz))
+
+res2_speed  %>%  filter(between(time_bin,-8,8))%>% na.omit() %>% summarise(mz = mean(sz), .by = c(time_bin,source)) %>% ggplot(aes(time_bin, mz))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~source)
+
+res2_speed %>%   filter(between(time_bin,-3,8),condition =='recall') %>% na.omit() %>% summarise(mz = mean(abs(speed)), .by = c(fear,time_bin)) %>% ggplot(aes(time_bin, mz,col=fear))+
+  geom_line()+
+  theme_classic()
+
+
+res2_speed %>%   filter(between(time_bin,-5,6)) %>% ggplot(aes(speed))+
+  geom_histogram()
+
+
+res2_speed %>%   filter(between(time_bin,-1,5)) %>% na.omit() %>% summarise(mz = mean(speed), .by = c(fear,time_bin)) %>% ggplot(aes(time_bin, mz,col=fear))+
+  geom_line()+
+  theme_classic()+
+  geom_smooth(span=0.2)+
+  geom_vline(inherit.aes = F,xintercept = seq(0,4,1))
+
+
+
+
+```
+
+# Up vs Down
+```{r}
+res2_speed %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% summarise(mz = mean(speed), .by = c(stim_id,time_bin)) %>% ggplot(aes(time_bin, mz,col=stim_id))+
+  geom_line()+
+  geom_smooth(span=0.1)+
+  theme_classic()
+```
+
+# naive Vs recall
+```{r}
+
+
+res2_speed %>% filter(between(time_bin,-8,8)) %>% na.omit() %>% summarise(mz = mean(speed), .by = c(time_bin,condition)) %>% ggplot(aes(time_bin, mz,col=condition))+
+  geom_line()+
+  theme_classic()
+
+
+res2_speed %>% filter(stim_id %in% c("Downsweep","Upsweep")) %>% filter(between(time_bin,-8,8)) %>% na.omit() %>% summarise(mz = mean(speed), .by = c(time_bin,condition,stim_id)) %>% ggplot(aes(time_bin, mz,col=stim_id))+
+  geom_smooth(span=0.1,se=F)+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~condition)
+
+
+
+res2_speed %>% filter(stim_id %in% c("Downsweep","Upsweep")) %>% filter(between(time_bin,-8,8)) %>% na.omit() %>% summarise(mz = mean(speed), .by = c(time_bin,condition,stim_id)) %>% ggplot(aes(time_bin, mz,col=condition))+
+  geom_smooth(span=0.1,se=F)+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~stim_id)
+
+
+
+res2_speed %>% filter(between(time_bin,-8,8)) %>% na.omit() %>% summarise(mz = mean(speed), .by = c(time_bin,condition)) %>% count(condition)
+
+```
+# fear and condition
+
+```{r}
+
+res2_speed %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% summarise(mz = mean(speed), .by = c(fear,time_bin,condition)) %>% ggplot(aes(time_bin, mz,col=condition))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~fear)
+
+
+res2_speed %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% summarise(mz = mean(speed), .by = c(fear,time_bin,condition)) %>% ggplot(aes(time_bin, mz,col=fear))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~condition)
+```
+
+
+```{r}
+
+res2_speed %>% filter(between(time_bin,-2,10)) %>% filter(condition=="recall") %>% na.omit() %>% summarise(mz = mean(speed), .by = c(fear,time_bin,trial_type)) %>% ggplot(aes(time_bin, mz,col=fear))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~trial_type)
+
+
+res2_speed %>% filter(between(time_bin,-2,10)) %>% filter(condition=="recall") %>% na.omit() %>% summarise(mz = mean(speed), .by = c(fear,time_bin,trial_type)) %>% ggplot(aes(time_bin, mz,col=trial_type))+
+  geom_line()+
+  theme_classic()+
+  facet_wrap(~fear)
+
+```
+
+
+
+
+# Opto
+
+```{r}
+ res3 <- df %>% select(!direction) %>% left_join(shock) %>% mutate(fear = ifelse(direction == stringr::str_remove(stim_id, "^Opto_"),'cs+',"cs-")) %>% 
+  mutate(Opto = ifelse(str_starts(stim_id, 'Opto'), 'opto', 'no')) %>% 
+  ungroup() %>% mutate(time_bin = time_relative) %>% group_by(source,trial_number) %>%  mutate(pz = (speed - mean(speed)) / sd(speed)) %>%  ungroup()
+
+
+res3 %>% filter(between(time_bin,-2,6)) %>% na.omit() %>% summarise(mz = mean(pz), .by = c(time_bin,Opto)) %>% ggplot(aes(time_bin, mz,col=Opto))+
+  geom_line()+
+  theme_classic()
+```
+
+```{r}
+res2_speed %>% filter(condition=="recall") %>% filter(between(rel_time,-5,5)) %>% summarise(speed_raw = mean(sz), .by=c(rel_time,Animal)) %>% ggplot(aes(rel_time,speed_raw))+
+  geom_line()+
+  facet_wrap(~Animal,scales="free")+
+  geom_vline(xintercept = 0)
+
+
+res2_speed %>% filter(condition=="recall") %>% filter(speed_raw > 0 ) %>% filter(trial_type =="Upsweep") %>% summarise(speed_raw = mean(speed_raw), .by=c(rel_time)) %>% ggplot(aes(rel_time,speed_raw))+
+  geom_line()
+
+
+res2_speed %>% filter(condition=="recall")  %>% filter(speed_raw < 0 ) %>% filter(trial_type =="Upsweep") %>% summarise(speed_raw = mean(speed_raw), .by=c(rel_time)) %>% ggplot(aes(rel_time,speed_raw))+
+  geom_line()
+
+
+  baseline_data <- res2_speed %>%
+    filter(rel_time < -1)
+  
+  baselines <- baseline_data %>%
+    group_by(Animal) %>%
+    summarise(
+      baseline_mean2 = mean(speed_raw, na.rm = TRUE),
+      baseline_sd2 = sd(speed_raw, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+
+catcat <- res2_speed %>% filter(condition=="recall") %>% filter(between(rel_time,-0.5,-0.1)) %>% left_join(baselines )%>%  summarise(speed=(mean(speed_raw)- mean(baseline_mean2)), .by=c(Animal,trial_number)) %>% mutate(speed_cat =  case_when(speed > 1 ~ "forward",speed < -1 ~ "backward",.default = "no")) %>% select(!speed)
+
+catcat %>% count(speed_cat)
+  
+res2_speed%>% filter(between(rel_time,-1,1))  %>% filter(condition=="recall")  %>%  left_join(catcat,by =c("Animal","trial_number")) %>% summarise(speed = mean(speed_raw), .by =c(rel_time,speed_cat)) %>% ggplot(aes(rel_time,speed,col=speed_cat))+
+  geom_line()
+
+
+catcat2<- res2_speed %>% filter(between(rel_time,-0.5,0)) %>% group_by(source,trial_number) %>% count(speed_direction) %>% mutate(speed_cat = as.factor(ifelse ( n > 30, speed_direction,0))) %>% ungroup()
+
+res2_speed%>% filter(between(rel_time,-1,1))  %>% filter(condition=="recall")  %>%  left_join(catcat2,by =c("source","trial_number")) %>% summarise(speed = mean(speed_raw), .by =c(rel_time,speed_cat)) %>% ggplot(aes(rel_time,speed,col=speed_cat))+
+  geom_line()
+
+
+
+
+catcat3 <- res2_speed%>% filter(between(rel_time,-0.3,-0.1))  %>% filter(condition=="recall")   %>% group_by(source,trial_number) %>% summarise(ms = mean(speed_raw))
+
+res2_speed %>% left_join(res2_speed %>% filter(between(rel_time,0,0))  %>% filter(condition=="recall") %>% select(source,trial_number,"speed0"=speed_raw)) %>% left_join(catcat3)%>% filter(between(rel_time,0.5,0.5))  %>% filter(condition=="recall") %>% mutate(sc = speed_raw-speed0) %>% ggplot(aes(ms,sc))+
+  geom_point()+
+  geom_smooth()
+
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lme4)
+
+dat <- res2_speed %>%
+  filter(condition == "recall") %>%
+  group_by(source, trial_number) %>%
+  summarise(
+    pre_speed = mean(speed_raw[rel_time >= -1 & rel_time < 0], na.rm = TRUE),
+    speed_0   = mean(speed_raw[abs(rel_time - 0) < 0.02], na.rm = TRUE),
+    speed_05  = mean(speed_raw[rel_time >= 0.45 & rel_time <= 0.55], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(stim_response = speed_05 - speed_0)
+
+dat %>%  filter(abs(pre_speed)>1, abs(stim_response) > 1) %>% ggplot(aes(pre_speed, stim_response)) +
+  geom_point(alpha = .4) 
+  ylim(-10,10)
+  
+  
+  
+
+res2_speed %>% filter(condition=="recall") %>% filter(between(rel_time,-5,10)) %>% mutate(speedcat = ifelse(speed < 0.5,"nomov","mov")) %>% group_by(source,trial_number)
+
+
+
+immobility <- res2_speed %>%
+  filter(condition == "recall",
+         between(rel_time, -5, 5)) %>%
+  mutate(speedcat = ifelse(speed < 0.5, "nomov", "mov")) %>%
+  group_by(source, trial_number) %>%
+  arrange(rel_time, .by_group = TRUE) %>%
+  
+  # identify continuous nomove bouts
+  mutate(
+    bout = cumsum(speedcat != lag(speedcat, default = "mov"))
+  ) %>%
+  group_by(source, trial_number, bout) %>%
+  summarise(
+    start_time = first(rel_time),
+    end_time   = last(rel_time),
+    duration   = end_time - start_time,
+    nomov_prop = mean(speedcat == "nomov"),
+    .groups = "drop"
+  ) %>%
+  
+  # actual immobility periods > 1 s
+  filter(duration >= 1,
+         nomov_prop >= 0.75)
+
+immobility %>%
+  mutate(period = ifelse(start_time < 0, "pre", "post")) %>%
+  count( period)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(slider)
+
+param_grid <- crossing(
+  duration_thresh = seq(0.1, 1, length.out = 9),
+  nomov_thresh = seq(0.70, 1, by = 0.05)
+)
+
+# Prepare data
+dat <- res2_speed %>%
+  filter(
+    condition == "recall",
+    between(rel_time, -5, 5)
+  ) %>%
+  mutate(
+    nomov = speed < 0.5
+  ) %>%
+  group_by(source, trial_number) %>%
+  arrange(rel_time, .by_group = TRUE) %>%
+  mutate(
+    dt = median(diff(rel_time))
+  ) %>%
+  ungroup()
+
+grid_results <- map_dfr(
+  seq_len(nrow(param_grid)),
+  function(i) {
+    
+    duration <- param_grid$duration_thresh[i]
+    prob <- param_grid$nomov_thresh[i]
+    
+    n_samples <- round(duration / unique(dat$dt))
+    
+    events <- dat %>%
+      group_by(source, trial_number) %>%
+      arrange(rel_time, .by_group = TRUE) %>%
+      mutate(
+        nomov_prop = slide_dbl(
+          nomov,
+          ~ mean(.x),
+          .after = n_samples - 1,
+          .complete = TRUE
+        ),
+        qualifying = nomov & nomov_prop >= prob,
+        new_event = qualifying &
+          !lag(qualifying, default = FALSE)
+      ) %>%
+      filter(new_event) %>%
+      ungroup() %>%
+      mutate(
+        period = ifelse(rel_time < 0, "pre", "post")
+      ) %>%
+      count(period, name = "n") %>%
+      complete(
+        period = c("pre", "post"),
+        fill = list(n = 0)
+      )
+    
+    tibble(
+      duration_thresh = duration,
+      nomov_thresh = prob,
+      pre = events$n[events$period == "pre"],
+      post = events$n[events$period == "post"]
+    )
+  }
+) %>%
+  mutate(
+    difference = post - pre,
+    ratio = post / pmax(pre, 1)
+  )
+
+ggplot(grid_results,
+       aes(duration_thresh, nomov_thresh, fill = ratio)) +
+  geom_tile() +
+  geom_text(aes(label = round(ratio,2)), size = 3) +
+  scale_x_continuous(breaks = unique(grid_results$duration_thresh)) +
+  scale_y_continuous(breaks = unique(grid_results$nomov_thresh)) +
+  labs(
+    x = "Minimum duration (s)",
+    y = "Minimum no-movement proportion",
+    fill = "Post / pre"
+  ) +
+  theme_classic()
+
+
+res2_speed %>% left_join(res2_speed %>% filter(between(rel_time,0,0))  %>% filter(condition=="recall") %>% select(source,trial_number,"speed0"=speed_raw)) %>% left_join(catcat3)%>% filter(between(rel_time,0.5,0.5))  %>% filter(condition=="recall") %>% mutate(sc = speed_raw-speed0) %>% ggplot(aes(ms,sc))+
+  geom_point()+
+  geom_smooth()+
+  xlim(-20,20)+
+  ylim(-30,30)
+
+```
+
+
+```{r}
+
+# ============================================================
+# Pre-stimulus movement-state analysis for res2_speed
+#
+# Goal:
+#   Test whether the post-stimulus speed response differs
+#   depending on whether the animal was:
+#     - consistently running forward before the stimulus
+#     - consistently running backward before the stimulus
+#     - still / mixed-direction before the stimulus
+#
+# This script:
+#   1. Defines several pre-stimulus classification windows.
+#   2. Requires stable direction within the chosen window.
+#   3. Classifies each trial as forward/backward/still.
+#   4. Computes delta speed relative to that trial's own pre-stimulus speed.
+#   5. Produces raw-speed and delta-speed plots.
+#
+# Important:
+#   - rel_time == 0 is the stimulus alignment time.
+#   - `source` is included in the trial ID because trial_number
+#     may repeat across sessions.
+#   - The shaded grey area in each plot is the window used to
+#     classify the animal's pre-stimulus movement state.
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(forcats)
+
+# ------------------------------------------------------------
+# SETTINGS
+# ------------------------------------------------------------
+
+condition_to_use <- "recall"
+
+# Time shown in the plots:
+plot_window <- c(-1.5, 2.0)
+
+# Baseline used only to establish a source-specific noise level.
+# This is intentionally separate from the pre-stimulus state window.
+baseline_window <- c(-5, -1)
+
+# Several classification windows to compare.
+# A gap before time 0 reduces the chance that movement beginning
+# exactly at sound onset determines the pre-stimulus category.
+classification_windows <- tibble(
+  window_name = c(
+    "Early pre-stimulus: -1.0 to -0.5 s",
+    "Middle pre-stimulus: -0.8 to -0.3 s",
+    "Late pre-stimulus: -0.4 to -0.1 s"
+  ),
+  window_start = c(-1.0, -0.8, -0.4),
+  window_end   = c(-0.5, -0.3, -0.1)
+)
+
+# Minimum absolute signed speed needed to consider an animal moving.
+# This threshold is in the units of speed_raw, which appear to be deg/s.
+# Change after inspecting the speed distribution if necessary.
+speed_threshold <- 1
+
+# A trial is called forward/backward only when this fraction of samples
+# in the classification window has the same direction.
+# Example: 0.75 means at least 75% of samples need to be > +threshold
+# or < -threshold, respectively.
+stable_direction_fraction <- 0.75
+
+# Post-stimulus interval summarized in the final per-trial response plot.
+response_window <- c(0.1, 0.6)
+
+# ------------------------------------------------------------
+# PREPARE DATA
+# ------------------------------------------------------------
+
+speed_data <- res2_speed %>%
+  filter(
+    condition == condition_to_use,
+    between(rel_time, min(baseline_window[1], plot_window[1]),
+            max(plot_window[2], response_window[2]))
+  ) %>%
+  mutate(
+    trial_id = interaction(source, Animal, trial_number, drop = TRUE),
+    rel_time = as.numeric(rel_time)
+  )
+
+# Check whether all expected columns are available.
+required_columns <- c(
+  "source", "Animal", "trial_number", "condition",
+  "rel_time", "speed_raw"
+)
+
+missing_columns <- setdiff(required_columns, names(speed_data))
+
+if (length(missing_columns) > 0) {
+  stop(
+    "res2_speed is missing required column(s): ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+# ------------------------------------------------------------
+# SOURCE-SPECIFIC BASELINES
+#
+# These are useful for inspecting pre-stimulus movement relative
+# to each source's normal signed-speed level.
+# ------------------------------------------------------------
+
+source_baselines <- speed_data %>%
+  filter(between(rel_time, baseline_window[1], baseline_window[2])) %>%
+  summarise(
+    baseline_speed = mean(speed_raw, na.rm = TRUE),
+    baseline_sd = sd(speed_raw, na.rm = TRUE),
+    n_baseline_samples = sum(!is.na(speed_raw)),
+    .by = c(source, Animal)
+  ) %>%
+  mutate(
+    baseline_sd = if_else(
+      is.na(baseline_sd) | baseline_sd == 0,
+      1,
+      baseline_sd
+    )
+  )
+
+# ------------------------------------------------------------
+# FUNCTION: CLASSIFY PRE-STIMULUS STATE
+#
+# The category is based on:
+#   1. Mean signed speed in the chosen pre-stimulus window.
+#   2. Fraction of samples with consistent positive/negative speed.
+#
+# forward:
+#   mean pre-speed > +threshold AND >= stable_direction_fraction
+#   of samples are > +threshold.
+#
+# backward:
+#   mean pre-speed < -threshold AND >= stable_direction_fraction
+#   of samples are < -threshold.
+#
+# still/mixed:
+#   all other trials, including low-speed and inconsistent-direction trials.
+# ------------------------------------------------------------
+classify_trials <- function(data, source_baselines,
+                            window_start, window_end, window_name,
+                            speed_threshold, stable_direction_fraction) {
+
+  pre_window_data <- data %>%
+    filter(between(rel_time, window_start, window_end)) %>%
+    select(-any_of(c("baseline_speed", "baseline_sd", "n_baseline_samples"))) %>%
+    left_join(
+      source_baselines %>%
+        select(source, Animal, baseline_speed),
+      by = c("source", "Animal")
+    )
+
+  pre_window_data %>%
+    summarise(
+      pre_speed = mean(speed_raw, na.rm = TRUE),
+
+      forward_fraction = mean(
+        speed_raw > speed_threshold,
+        na.rm = TRUE
+      ),
+
+      backward_fraction = mean(
+        speed_raw < -speed_threshold,
+        na.rm = TRUE
+      ),
+
+      stationary_fraction = mean(
+        abs(speed_raw) <= speed_threshold,
+        na.rm = TRUE
+      ),
+
+      n_samples_pre_window = sum(!is.na(speed_raw)),
+
+      baseline_speed = first(baseline_speed),
+
+      .by = c(source, Animal, trial_number, trial_id)
+    ) %>%
+    mutate(
+      pre_speed_minus_baseline = pre_speed - baseline_speed,
+
+      movement_state = case_when(
+        pre_speed_minus_baseline > speed_threshold &
+          forward_fraction >= stable_direction_fraction ~ "forward",
+
+        pre_speed_minus_baseline < -speed_threshold &
+          backward_fraction >= stable_direction_fraction ~ "backward",
+
+        TRUE ~ "still / mixed"
+      ),
+
+      movement_state = factor(
+        movement_state,
+        levels = c("backward", "still / mixed", "forward")
+      ),
+
+      classification_window = window_name,
+      classification_start = window_start,
+      classification_end = window_end
+    )
+}
+
+# ------------------------------------------------------------
+# CLASSIFY TRIALS FOR EVERY WINDOW
+# ------------------------------------------------------------
+
+trial_states_all <- classification_windows %>%
+  mutate(
+    trial_state = purrr::pmap(
+      list(
+        window_start,
+        window_end,
+        window_name
+      ),
+      ~ classify_trials(
+        data = speed_data,
+        source_baselines = source_baselines,
+        window_start = ..1,
+        window_end = ..2,
+        window_name = ..3,
+        speed_threshold = speed_threshold,
+        stable_direction_fraction = stable_direction_fraction
+      )
+    )
+  ) %>%
+  select(trial_state) %>%
+  unnest(trial_state)
+
+# Print how many trials fall in each category for each window.
+print(
+  trial_states_all %>%
+    count(classification_window, movement_state) %>%
+    group_by(classification_window) %>%
+    mutate(
+      fraction_of_trials = n / sum(n)
+    ) %>%
+    ungroup()
+)
+
+# ------------------------------------------------------------
+# BUILD PLOTTING DATA
+#
+# delta_speed is calculated relative to each trial's own mean
+# speed in the classification window:
+#
+#   delta_speed = speed_raw - pre_speed
+#
+# Therefore:
+#   - each trial is centered relative to its own pre-stimulus state
+#   - post-stimulus changes are easier to compare
+#   - raw traces will differ before zero by design
+#   - delta traces should be interpreted as within-trial changes
+# ------------------------------------------------------------
+
+speed_with_states <- speed_data %>%
+  filter(between(rel_time, plot_window[1], plot_window[2])) %>%
+  inner_join(
+    trial_states_all %>%
+      select(
+        source, Animal, trial_number, trial_id,
+        classification_window,
+        classification_start,
+        classification_end,
+        movement_state,
+        pre_speed,
+        pre_speed_minus_baseline,
+        forward_fraction,
+        backward_fraction,
+        stationary_fraction
+      ),
+    by = c("source", "Animal", "trial_number", "trial_id")
+  ) %>%
+  mutate(
+    delta_speed = speed_raw - pre_speed
+  )
+
+# Mean and SEM at each time point.
+plot_summary <- speed_with_states %>%
+  summarise(
+    mean_raw_speed = mean(speed_raw, na.rm = TRUE),
+    sem_raw_speed = sd(speed_raw, na.rm = TRUE) /
+      sqrt(sum(!is.na(speed_raw))),
+
+    mean_delta_speed = mean(delta_speed, na.rm = TRUE),
+    sem_delta_speed = sd(delta_speed, na.rm = TRUE) /
+      sqrt(sum(!is.na(delta_speed))),
+
+    n_trials = n_distinct(trial_id),
+    .by = c(
+      classification_window,
+      classification_start,
+      classification_end,
+      rel_time,
+      movement_state
+    )
+  )
+
+# ------------------------------------------------------------
+# PLOT 1:
+# RAW SIGNED SPEED BY PRE-STIMULUS MOVEMENT STATE
+#
+# Interpretation:
+#   Groups differ before time zero partly by construction:
+#   they were defined using pre-stimulus signed speed.
+#
+# This plot is useful to inspect the actual running trajectories.
+# ------------------------------------------------------------
+
+raw_speed_plot <- ggplot(
+  plot_summary,
+  aes(
+    x = rel_time,
+    y = mean_raw_speed,
+    colour = movement_state,
+    fill = movement_state
+  )
+) +
+  geom_rect(
+    aes(
+      xmin = classification_start,
+      xmax = classification_end,
+      ymin = -Inf,
+      ymax = Inf
+    ),
+    inherit.aes = FALSE,
+    fill = "grey70",
+    alpha = 0.22
+  ) +
+  geom_hline(
+    yintercept = 0,
+    colour = "grey55",
+    linewidth = 0.4
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.7
+  ) +
+  geom_ribbon(
+    aes(
+      ymin = mean_raw_speed - sem_raw_speed,
+      ymax = mean_raw_speed + sem_raw_speed
+    ),
+    alpha = 0.17,
+    colour = NA
+  ) +
+  geom_line(
+    linewidth = 0.85
+  ) +
+  facet_wrap(
+    ~ classification_window,
+    ncol = 1
+  ) +
+  scale_colour_manual(
+    values = c(
+      "backward" = "#377EB8",
+      "still / mixed" = "#666666",
+      "forward" = "#E41A1C"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "backward" = "#377EB8",
+      "still / mixed" = "#666666",
+      "forward" = "#E41A1C"
+    )
+  ) +
+  labs(
+    title = "Raw signed running speed by pre-stimulus movement state",
+    subtitle = paste0(
+      "Grey shading = classification window. ",
+      "Forward/backward requires mean speed beyond ±",
+      speed_threshold,
+      " and at least ",
+      stable_direction_fraction * 100,
+      "% of samples in the same direction."
+    ),
+    x = "Time from stimulus onset (s)",
+    y = "Mean signed running speed (deg/s)",
+    colour = "Pre-stimulus state",
+    fill = "Pre-stimulus state",
+    caption = paste0(
+      "Dashed vertical line: stimulus onset (0 s). ",
+      "Shaded bands: ±SEM across time-point observations."
+    )
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold")
+  )
+
+print(raw_speed_plot)
+
+# ------------------------------------------------------------
+# PLOT 2:
+# DELTA SPEED RELATIVE TO EACH TRIAL'S PRE-STIMULUS SPEED
+#
+# Interpretation:
+#   delta_speed = current signed speed - that trial's mean speed
+#   in the shaded pre-stimulus classification window.
+#
+# A positive value means movement became more forward than before.
+# A negative value means movement became more backward/slower than before.
+# ------------------------------------------------------------
+
+delta_speed_plot <- ggplot(
+  plot_summary,
+  aes(
+    x = rel_time,
+    y = mean_delta_speed,
+    colour = movement_state,
+    fill = movement_state
+  )
+) +
+  geom_rect(
+    aes(
+      xmin = classification_start,
+      xmax = classification_end,
+      ymin = -Inf,
+      ymax = Inf
+    ),
+    inherit.aes = FALSE,
+    fill = "grey70",
+    alpha = 0.22
+  ) +
+  geom_hline(
+    yintercept = 0,
+    colour = "grey55",
+    linewidth = 0.4
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.7
+  ) +
+  geom_ribbon(
+    aes(
+      ymin = mean_delta_speed - sem_delta_speed,
+      ymax = mean_delta_speed + sem_delta_speed
+    ),
+    alpha = 0.17,
+    colour = NA
+  ) +
+  geom_line(
+    linewidth = 0.85
+  ) +
+  facet_wrap(
+    ~ classification_window,
+    ncol = 1
+  ) +
+  scale_colour_manual(
+    values = c(
+      "backward" = "#377EB8",
+      "still / mixed" = "#666666",
+      "forward" = "#E41A1C"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "backward" = "#377EB8",
+      "still / mixed" = "#666666",
+      "forward" = "#E41A1C"
+    )
+  ) +
+  labs(
+    title = "Stimulus-evoked change in signed running speed",
+    subtitle = "Each trial is centered on its own mean speed in the grey pre-stimulus classification window.",
+    x = "Time from stimulus onset (s)",
+    y = "Change from pre-stimulus speed (deg/s)",
+    colour = "Pre-stimulus state",
+    fill = "Pre-stimulus state",
+    caption = paste0(
+      "Positive values: more forward movement than pre-stimulus level. ",
+      "Negative values: more backward movement or less forward movement."
+    )
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold")
+  )
+
+print(delta_speed_plot)
+
+# ------------------------------------------------------------
+# PLOT 3:
+# PROPORTION OF TRIALS IN EACH CATEGORY
+#
+# This helps determine whether a classification window generates
+# enough trials in forward and backward categories for comparison.
+# ------------------------------------------------------------
+
+category_counts <- trial_states_all %>%
+  count(classification_window, movement_state) %>%
+  group_by(classification_window) %>%
+  mutate(
+    proportion = n / sum(n)
+  ) %>%
+  ungroup()
+
+state_counts_plot <- ggplot(
+  category_counts,
+  aes(
+    x = classification_window,
+    y = proportion,
+    fill = movement_state
+  )
+) +
+  geom_col(
+    colour = "white",
+    linewidth = 0.35
+  ) +
+  geom_text(
+    aes(label = paste0(n, " trials")),
+    position = position_stack(vjust = 0.5),
+    colour = "white",
+    size = 3.5
+  ) +
+  scale_fill_manual(
+    values = c(
+      "backward" = "#377EB8",
+      "still / mixed" = "#666666",
+      "forward" = "#E41A1C"
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format()
+  ) +
+  labs(
+    title = "Trial classification counts across pre-stimulus windows",
+    subtitle = paste0(
+      "Stable direction criterion: at least ",
+      stable_direction_fraction * 100,
+      "% of samples beyond ±",
+      speed_threshold,
+      " deg/s."
+    ),
+    x = "Pre-stimulus classification window",
+    y = "Proportion of recall trials",
+    fill = "Pre-stimulus state"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    legend.position = "bottom"
+  )
+
+print(state_counts_plot)
+
+# ------------------------------------------------------------
+# TRIAL-LEVEL POST-STIMULUS RESPONSE
+#
+# One value per trial:
+#
+#   response_delta =
+#       mean signed speed from 0.1 to 0.6 s
+#       minus
+#       mean signed speed in the pre-stimulus classification window
+#
+# This is preferable to treating every 10-ms sample as independent.
+# ------------------------------------------------------------
+
+trial_post_responses <- speed_with_states %>%
+  filter(between(rel_time, response_window[1], response_window[2])) %>%
+  summarise(
+    post_speed = mean(speed_raw, na.rm = TRUE),
+    pre_speed = first(pre_speed),
+    response_delta = mean(delta_speed, na.rm = TRUE),
+    .by = c(
+      source,
+      Animal,
+      trial_number,
+      trial_id,
+      classification_window,
+      movement_state
+    )
+  )
+
+# ------------------------------------------------------------
+# PLOT 4:
+# PER-TRIAL POST-STIMULUS DELTA SPEED
+#
+# Each dot is one trial. Large points show animal-level means.
+# This prevents a single animal/session with many trials from
+# visually dominating the result.
+# ------------------------------------------------------------
+
+animal_response_summary <- trial_post_responses %>%
+  summarise(
+    animal_mean_response = mean(response_delta, na.rm = TRUE),
+    n_trials = n(),
+    .by = c(
+      Animal,
+      classification_window,
+      movement_state
+    )
+  )
+
+post_response_plot <- ggplot(
+  trial_post_responses,
+  aes(
+    x = movement_state,
+    y = response_delta,
+    colour = movement_state
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    colour = "grey50",
+    linewidth = 0.5
+  ) +
+  geom_jitter(
+    width = 0.12,
+    alpha = 0.18,
+    size = 1.5
+  ) +
+  geom_point(
+    data = animal_response_summary,
+    aes(
+      x = movement_state,
+      y = animal_mean_response,
+      fill = movement_state
+    ),
+    inherit.aes = FALSE,
+    shape = 21,
+    colour = "black",
+    stroke = 0.5,
+    size = 3.5
+  ) +
+  facet_wrap(
+    ~ classification_window,
+    ncol = 1
+  ) +
+  scale_colour_manual(
+    values = c(
+      "backward" = "#377EB8",
+      "still / mixed" = "#666666",
+      "forward" = "#E41A1C"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "backward" = "#377EB8",
+      "still / mixed" = "#666666",
+      "forward" = "#E41A1C"
+    )
+  ) +
+  labs(
+    title = "Trial-level post-stimulus speed change by pre-stimulus state",
+    subtitle = paste0(
+      "Response window: ",
+      response_window[1],
+      " to ",
+      response_window[2],
+      " s after stimulus. Small dots = trials; large dots = animal means."
+    ),
+    x = "Pre-stimulus movement state",
+    y = "Post-stimulus speed change from pre-stimulus level (deg/s)",
+    colour = "Pre-stimulus state",
+    fill = "Pre-stimulus state"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold")
+  )
+
+print(post_response_plot)
+
+# ------------------------------------------------------------
+# OPTIONAL: SAVE ALL OUTPUTS
+# ------------------------------------------------------------
+
+
+```
+

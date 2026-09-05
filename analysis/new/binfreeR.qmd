@@ -1,0 +1,1957 @@
+---
+title: "bintry"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+library(tidyverse)
+source("C:/Users/Freitag/Documents/GitHub/Phd_Letzkus/analysis/general/data_helpers.R")
+library(data.table)
+
+
+binfree_path <- "I:/Data/aligned/all_good/aligned_raw"
+metrics_path <- "I:/Data/aligned/all_good/extra/metrics"
+shock_file <- "I:/Data/aligned/extra/Shock_direction.csv"
+
+bomb_path <- "I:/Data/aligned/all_good/extra/bomb"
+depth_path <- "I:/Data/aligned/all_good/extra/extremum"
+
+binfree <- read_csv_folder(
+  folder_path = binfree_path,
+  source_column = "source",
+  remove_unnamed_columns = FALSE
+) %>%
+  add_animal_condition(source_column = "source")
+
+
+
+shock <- load_shock_direction(shock_file)
+
+
+
+# ------------------------------------------------------------------------------
+# Bomb-cell labels
+# ------------------------------------------------------------------------------
+
+bomb <- read_csv_folder(
+  folder_path = bomb_path,
+  source_column = "source"
+) %>%
+  mutate(
+    cluster_id = paste(unit_id, source, sep = "_")
+  )
+
+bombg <- bomb %>%
+  filter(bombcell_label == "good")
+
+
+
+# ------------------------------------------------------------------------------
+# Electrode depth / cortex labels
+# ------------------------------------------------------------------------------
+
+depth_files <- list.files(
+  path = depth_path,
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+
+depths <- map_dfr(depth_files, function(file) {
+
+  source <- tools::file_path_sans_ext(basename(file))
+
+  read_csv(
+    file,
+    col_types = cols(extremum_channel = col_character()),
+    show_col_types = FALSE
+  ) %>%
+    mutate(source = source)
+}) %>%
+  group_by(source) %>%
+  mutate(
+    dist_from_max = max(dist_from_tip_um) - dist_from_tip_um,
+    cortex = if_else(dist_from_max < 1000, "cortex", "no"),
+    cluster_id = paste(unit_id, source, sep = "_")
+  ) %>%
+  ungroup() %>%
+  select(cluster_id, dist_from_max, cortex)
+
+
+
+```
+
+#add meta
+
+```{r}
+
+# ------------------------------------------------------------------------------
+# Trial alignment and readable trial labels
+# ------------------------------------------------------------------------------
+
+sound_state_names <- c(
+  "Downsweep",
+  "Upsweep",
+  "Opto_Upwsweep",
+  "Opto_Upsweep",
+  "Opto_Downsweep",
+  "Laser_Only"
+)
+
+trial_starts <- binfree %>%
+  filter(state_name %in% sound_state_names) %>%
+  group_by(Animal, condition, trial_number) %>%
+  summarise(
+    minT = min(seconds),
+    .groups = "drop"
+  )
+
+binfree <- binfree %>%
+  left_join(
+    trial_starts,
+    by = c("Animal", "condition", "trial_number")
+  ) %>%
+  mutate(
+    rel_time = seconds - minT
+  ) %>%
+  recode_trial_type() %>%
+  mutate(
+    cluster_id = paste(cluster_id, Animal, condition, sep = "_"),
+    trial_number = paste(trial_number, Animal, condition, sep = "_")
+  ) 
+
+
+
+
+# ------------------------------------------------------------------------------
+# Apply quality-metric filter
+# ------------------------------------------------------------------------------
+
+qm <- load_quality_metrics(
+  metrics_path = metrics_path,
+  presence_cutoff = 0.8
+)  %>%
+  mutate(
+    cluster_id = str_replace(
+      cluster_id,
+      "^((?:[^_]+_){2}[^_]+).*",
+      "\\1"
+    )
+  )
+
+
+
+binfree <- binfree %>%
+  filter(cluster_id %in% qm$cluster_id) 
+
+
+
+```
+
+#realign time
+
+```{r}
+
+
+
+setDT(binfree)
+
+# 1. Get unique event times (anchors) PER Animal and condition
+# This ensures we don't align Animal 1 to Animal 2's events.
+anchor_dt <- binfree[!is.na(minT), .(anchor = unique(minT)), by = .(Animal, condition)]
+
+# Set the key to include the grouping variables + the time variable
+setkey(anchor_dt, Animal, condition, anchor)
+
+# 2. Perform the rolling join with grouping constraints
+# We add Animal and condition to the 'on' statement.
+binfree[, nearest_fixed := anchor_dt[binfree, 
+                                     on = .(Animal, condition, anchor = seconds), 
+                                     roll = "nearest", 
+                                     x.anchor]]
+
+# 3. Compute relative time
+binfree[, rel_time := seconds - nearest_fixed]
+
+# 4. Rebuild trial structure
+setorder(binfree, Animal, condition, seconds)
+binfree[, aligntrial := cumsum(c(TRUE, diff(rel_time) < -1)), by = .(Animal, condition)]
+binfree[, aligntrial2 := paste(aligntrial, Animal, condition, sep = "_")]
+
+# 5. Fix trial_type consistency
+# For each trial, find the trial_type where rel_time is closest to 0
+binfree[, trial_type := trial_type[which.min(abs(rel_time))], by = .(Animal, condition, aligntrial)]
+
+# Now we can safely select and unique-ify later
+binfree <- as_tibble(binfree) %>% 
+  select(cluster_id, state_name, trial_type, seconds, rel_time, Animal, condition, trial_number = aligntrial2)
+
+
+binfree %>% distinct(trial_number,trial_type) %>% group_by(trial_number) %>% count(trial_type) %>% filter(n>1)
+
+
+
+```
+
+#calculate baseline
+
+```{r}
+
+
+
+
+df_all <- as.data.table(binfree)
+
+baseline_stats_list <- df_all[, {
+
+  df <- .SD[rel_time >= -35 & rel_time < -5]
+
+  # time range (per session)
+  curr_range <- range(df$rel_time, na.rm = TRUE)
+
+  bin_width <- 1
+  breaks <- seq(curr_range[1], curr_range[2], by = bin_width)
+  centers <- breaks[-length(breaks)] + (bin_width / 2)
+  num_bins <- length(centers)
+
+  df[, bin_idx := findInterval(rel_time, breaks)]
+  df_in <- df[bin_idx > 0 & bin_idx <= num_bins]
+
+  # counts
+  counts <- df_in[, .(
+    event_count = .N
+  ), by = .(cluster_id, trial_number, trial_type, bin_idx)]
+
+  # full grid (session-local!)
+  full_grid <- CJ(
+    cluster_id   = unique(df$cluster_id),
+    trial_number = unique(df$trial_number),
+    trial_type   = unique(df$trial_type),
+    bin_idx      = seq_len(num_bins)
+  )
+
+  res <- counts[full_grid,
+                on = .(cluster_id, trial_number, trial_type, bin_idx)]
+
+  res[is.na(event_count), event_count := 0]
+
+  res[, `:=`(
+    rel_time = centers[bin_idx],
+    rate     = event_count / bin_width
+  )]
+
+  baseline_binned <- res[, .(
+    rate = mean(rate)
+  ), by = .(cluster_id, trial_number, trial_type, bin_idx, rel_time)]
+
+  baseline_binned[, .(
+    base_mean = mean(rate),
+    base_sd   = sd(rate)
+  ), by = cluster_id]
+
+}, by = .(Animal, condition)]
+
+baseline_stats_list <- baseline_stats_list  %>% filter(cluster_id %in% qm$cluster_id)
+
+rm(anchor_dt)
+rm(qm)
+rm(df_all)
+
+
+binfree<- binfree %>% mutate(Animal = as.character(Animal)) %>% add_fear_labels(shock, stimulus_column = "trial_type")
+
+
+Sessions<- binfree %>% distinct(Animal,condition,direction,fear)
+units <- binfree %>% distinct(cluster_id) %>% left_join(depths) %>% left_join(bomb %>% select(!unit_index))
+
+
+
+
+binfree %>%  write_csv("I:/Data/aligned/all_good/wrangled/binfree.csv")
+Sessions %>%  write_csv("I:/Data/aligned/all_good/wrangled/sessions.csv")
+units %>%  write_csv("I:/Data/aligned/all_good/wrangled/units.csv")
+baseline_stats_list %>%  write_csv("I:/Data/aligned/all_good/wrangled/baseline_stats_list.csv")    
+```
+
+```{r}
+
+
+
+
+binfree<- binfree %>% mutate(Animal = as.character(Animal)) %>% add_fear_labels(shock, stimulus_column = "trial_type")
+
+
+Sessions<- binfree %>% distinct(Animal,condition,direction,fear)
+units <- binfree %>% distinct(cluster_id) %>% left_join(depths) %>% left_join(bomb %>% select(!unit_index))
+
+units %>%  filter(bombcell_label %in% c('good'),cortex=='cortex') %>% 
+  mutate(condition = word(cluster_id, 3, sep = fixed("_"))) %>% mutate(Animal = word(cluster_id, 2, sep = fixed("_"))) %>%  ggplot(aes(condition,fill=bombcell_label))+
+  geom_bar()+
+  facet_wrap(~Animal)
+
+```
+
+```{r}
+binfree %>% write_csv("I:/Data/aligned/all_good/wrangled/binfree.csv")
+
+baseline_stats_list %>% write_csv("I:/Data/aligned/all_good/wrangled/baselines.csv")
+```
+
+```{r}
+library(tidyverse)
+library(data.table)
+binfree <- data.table::fread("I:/Data/aligned/new/binfree/wrangled/binfree.csv")
+
+baseline_stats_list <- read_csv("I:/Data/aligned/new/binfree/wrangled/baselines.csv") %>% mutate(Animal = as.character(Animal))
+
+
+Sessions<- binfree %>% distinct(Animal,condition,direction,fear)
+units <- binfree %>% distinct(cluster_id) %>% left_join(depths) %>% left_join(bomb %>% select(!unit_index))
+
+```
+
+```{r}
+
+
+
+
+bin_events_dt_final <- function(dt, bin_width, 
+                                groups = c("cluster_id", "trial_number", "trial_type"), 
+                                split_by = c("Animal", "condition"),
+                                average_by = NULL, # New argument
+                                bin_range = NULL, 
+                                Zscore = TRUE, 
+                                baseline_df = NULL, 
+                                smooth_sd = 0) {
+  
+  df_all <- as.data.table(dt)
+  
+  # Define the internal processing core
+  process_chunk <- function(df, current_baseline = NULL) {
+    
+    # 1. Standardized Binning Logic
+    # We use bin_range to ensure all chunks have identical rel_time bins
+   # 1. Standardized Binning Logic
+    # Snap the min and max to absolute multiples of bin_width
+    # This makes the bin grid completely independent of the exact bin_range values
+    min_break <- floor(bin_range[1] / bin_width) * bin_width
+    max_break <- ceiling(bin_range[2] / bin_width) * bin_width
+    
+    breaks <- seq(min_break, max_break, by = bin_width)
+    
+    # Dynamically calculate the precision needed based on bin_width 
+    # e.g., bin_width = 0.05 -> needs ~4 decimal places of safety
+    precision <- max(0, ceiling(-log10(bin_width))) + 2
+    
+    # Round breaks and centers to eliminate floating-point artifacts
+    breaks <- round(breaks, precision)
+    centers <- round(breaks[-length(breaks)] + (bin_width / 2), precision)
+    num_bins <- length(centers)
+    
+    # Use rightmost.closed = TRUE so spikes at the exact max range aren't dropped
+    df[, bin_idx := findInterval(rel_time, breaks, rightmost.closed = TRUE)]
+    df_in <- df[bin_idx > 0 & bin_idx <= num_bins]
+    
+    
+    
+    # 2. n_trials per Chunk
+    # Since all neurons participated in all trials, we calculate this once for the whole chunk
+    total_trials_in_chunk <- df[, uniqueN(trial_number)]
+    counts <- df_in[, .(event_count = .N), by = .(cluster_id, trial_number, trial_type, bin_idx)]
+    # 1. Define the unique entities
+    all_clusters <- unique(df$cluster_id)
+    # This captures the unique mapping of trial numbers to their types
+    # This prevents the "nonsensical combinations" you mentioned
+    trial_mapping <- unique(df[, .(trial_number, trial_type)]) 
+    
+    # 2. Create the "Identity" Grid (Every neuron x Every valid trial)
+    # This handles neurons that might have been silent for a whole trial
+    identity_grid <- CJ(cluster_id = all_clusters, trial_number = trial_mapping$trial_number)
+    
+    # 5. Join mapping back (Safe from row explosion now)
+    identity_grid <- merge(identity_grid, trial_mapping, by = "trial_number", all.x = TRUE)
+    
+    # 6. Expand by Time (The Full Rank step)
+    # Using CJ here instead of merge(by = NULL) avoids the error you just saw
+    full_grid <- CJ(
+      cluster_id = all_clusters, 
+      trial_number = trial_mapping$trial_number, 
+      bin_idx = seq_len(num_bins)
+    )
+    
+    # Re-attach trial_type to the full_grid
+    full_grid <- merge(full_grid, trial_mapping, by = "trial_number", all.x = TRUE)
+    
+    # 7. Join counts onto the full grid
+    res <- counts[full_grid, on = .(cluster_id, trial_number, trial_type, bin_idx)]
+    res[is.na(event_count), event_count := 0]
+    
+    # 3. Normalization (Rate calculation)
+    # If trial_number is in groups, we are doing trial-by-trial (rate = count / width)
+    # If not, we divide by the total trials in this chunk
+    if (!"trial_number" %in% groups) {
+      res[, rate := event_count / bin_width / total_trials_in_chunk]
+    } else {
+      res[, rate := event_count / bin_width]
+    }
+    
+    res[, rel_time := centers[bin_idx]]
+    
+    # 4. Gaussian Smoothing
+    if (!is.null(smooth_sd) && smooth_sd > 0) {
+      sigma_bins <- smooth_sd / bin_width
+      half_width <- ceiling(4 * sigma_bins)
+      k_idx <- seq(-half_width, half_width)
+      kernel <- exp(-(k_idx^2) / (2 * sigma_bins^2))
+      kernel <- kernel / sum(kernel)
+      
+      # Smooth per unit/trial
+      smooth_groups <- intersect(c("cluster_id", "trial_number"), names(res))
+      res[, rate := as.numeric(stats::filter(rate, kernel, sides = 2)), by = smooth_groups]
+      res[is.na(rate), rate := 0] 
+    }
+    
+    # 5. Z-Score Section
+    if (Zscore) {
+      if (!is.null(current_baseline)) {
+        res <- merge(res, current_baseline, by = "cluster_id", all.x = TRUE)
+        res[, z_rate := (rate - base_mean) / (base_sd + 1e-9)]
+        cols_to_remove <- intersect(names(res), c("base_mean", "base_sd"))
+        res[, (cols_to_remove) := NULL]
+      } else {
+        res[, z_rate := (rate - mean(rate, na.rm = TRUE)) / (sd(rate, na.rm = TRUE) + 1e-9), by = cluster_id]
+      }
+    }
+    
+    # 6. Averaging Logic
+    if (!is.null(average_by)) {
+      agg_cols <- "rate"
+      if (Zscore) agg_cols <- c("rate", "z_rate")
+      avg_groups <- c("rel_time", average_by)
+      res <- res[, lapply(.SD, mean, na.rm = TRUE), by = avg_groups, .SDcols = agg_cols]
+    }
+    
+    return(res)
+  }
+
+  # --- Handle Splitting Logic ---
+  if (!is.null(split_by)) {
+    chunks <- split(df_all, by = split_by, keep.by = TRUE)
+    
+    res_list <- lapply(chunks, function(sub_dt) {
+      sub_baseline <- NULL
+      if (!is.null(baseline_df)) {
+        match_criteria <- sub_dt[1, ..split_by]
+        sub_baseline <- as.data.table(baseline_df)[match_criteria, on = split_by]
+      }
+      process_chunk(sub_dt, sub_baseline)
+    })
+    final_res <- rbindlist(res_list, use.names = TRUE, fill = TRUE)
+  } else {
+    final_res <- process_chunk(df_all, baseline_df)
+  }
+
+  if ("bin_idx" %in% names(final_res)) final_res[, bin_idx := NULL]
+  return(as_tibble(final_res))
+}
+```
+
+
+# responses over trials
+
+```{r}
+res2 <- binfree %>% 
+  mutate(Opto = ifelse(str_starts(trial_type, 'Opto'), 'opto', 'no')) %>% 
+  filter(Opto == "no") %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  group_by(Animal, condition,fear) %>% 
+  filter(trial_sequence %in% sort(unique(trial_sequence))[1:12]) %>% 
+  ungroup() %>% 
+  bin_events_dt_final(
+    bin_width = 0.1,
+    bin_range = c(-0.1,5), # Averages trials, keeps clusters
+    baseline_df = baseline_stats_list,
+    average_by = NULL)
+
+
+
+
+id_lookup <- res2 %>%
+  distinct(cluster_id) %>%
+  separate(cluster_id, into = c("trash", "Animal", "condition"), sep = "_", extra = "merge",remove = F) %>% select(!trash)
+
+res2 <- res2 %>% left_join(id_lookup) %>% left_join(shock) %>% mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"),'cs+',"cs-")) %>% left_join(depths) 
+ res2 <- res2 %>%  filter(cluster_id %in% bombg$cluster_id)
+
+# in the cs+ condition, it looks like later trials ( lighter colors) have higher responses
+
+res2 %>% filter(between(rel_time,-0.1,5.15)) %>% left_join(shock) %>% mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"),'cs+',"cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  
+  group_by(Animal, condition,fear) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>% 
+  
+  group_by(trial_rank, rel_time,fear) %>% 
+  summarise(mz = mean(rate), .groups = "drop") %>% 
+  
+  ggplot(aes(rel_time, mz, group = trial_rank, col = trial_rank)) +
+  geom_line()+
+  facet_wrap(~fear)
+
+
+# seeing this per peak ( sound repetion) it seems like cs+ does indeed increase with trials
+
+res2 %>% mutate(rel_time = round(rel_time,2)) %>% mutate(peak = case_when(rel_time == 0.05 ~ 1,
+  rel_time == 1.05 ~ 2,
+  rel_time == 2.05 ~ 3,
+  rel_time == 3.05 ~ 4,
+  rel_time == 4.05 ~ 5,.default = NA)) %>% na.omit() %>% left_join(shock) %>% mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"),'cs+',"cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  
+  group_by(Animal, condition,fear) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  group_by(trial_rank, peak,fear) %>% 
+  summarise(mz = mean(rate), .groups = "drop") %>% group_by(peak,fear) %>% mutate(mz = mz / max(mz))  %>% ggplot(aes(trial_rank,mz,col=fear,group=fear))+
+  geom_point()+
+  facet_grid(~peak)+
+  geom_smooth(method = "lm", se = FALSE)
+
+# plotting this by conditions reveals that this is also true for naive animals
+res2 %>% mutate(rel_time = round(rel_time,2)) %>% mutate(peak = case_when(rel_time == 0.05 ~ 1,
+  rel_time == 1.05 ~ 2,
+  rel_time == 2.05 ~ 3,
+  rel_time == 3.05 ~ 4,
+  rel_time == 4.05 ~ 5,.default = NA)) %>% na.omit() %>% left_join(shock) %>% mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"),'cs+',"cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  
+  group_by(Animal, condition,fear) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  group_by(condition,trial_rank, peak,fear) %>% 
+  summarise(mz = mean(rate), .groups = "drop") %>% group_by(peak,condition,fear) %>% mutate(mz = mz / max(mz))  %>% ggplot(aes(trial_rank,mz,col=fear,group=fear))+
+  geom_point()+
+  facet_grid(condition~peak)+
+  geom_smooth(method = "lm", se = FALSE)
+
+
+
+
+# looking directly at the slopes 
+
+slopes <- res2 %>% filter(cluster_id %in% bombg$cluster_id)  %>% 
+  mutate(rel_time = round(rel_time, 2)) %>% 
+  mutate(peak = case_when(
+    rel_time == 0.05 ~ 1,
+    rel_time == 1.05 ~ 2,
+    rel_time == 2.05 ~ 3,
+    rel_time == 3.05 ~ 4,
+    rel_time == 4.05 ~ 5,
+    TRUE ~ NA_real_
+  )) %>% 
+  na.omit() %>% 
+  left_join(shock) %>% 
+  mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"), 'cs+', "cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  group_by(Animal, fear) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  
+  group_by(Animal,trial_rank, peak, fear) %>% 
+  summarise(mz = mean(rate), .groups = "drop") %>% 
+
+  # 🔑 fit LM per facet
+  group_by(Animal,peak, fear) %>% 
+  summarise(
+    slope = coef(lm(mz ~ trial_rank))[2],
+    .groups = "drop"
+  )
+
+slopes %>% group_by(peak, fear) %>% 
+  summarise( slope = mean(slope)
+  ) %>%  ggplot(aes(peak,slope,col=fear))+
+  geom_point()
+
+# by condition is sad again
+
+slopes <- res2 %>% filter(cluster_id %in% bombg$cluster_id)  %>% 
+  mutate(rel_time = round(rel_time, 2)) %>% 
+  mutate(peak = case_when(
+    rel_time == 0.05 ~ 1,
+    rel_time == 1.05 ~ 2,
+    rel_time == 2.05 ~ 3,
+    rel_time == 3.05 ~ 4,
+    rel_time == 4.05 ~ 5,
+    TRUE ~ NA_real_
+  )) %>% 
+  na.omit() %>% 
+  left_join(shock) %>% 
+  mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"), 'cs+', "cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  
+  group_by(condition,Animal,trial_rank, peak, fear) %>% 
+  summarise(mz = mean(rate), .groups = "drop") %>% 
+
+  # 🔑 fit LM per facet
+  group_by(condition,Animal,peak, fear) %>% 
+  summarise(
+    slope = coef(lm(mz ~ trial_rank))[2],
+    .groups = "drop"
+  )
+
+slopes %>% group_by(condition,peak, fear) %>% 
+  summarise( slope = mean(slope)
+  ) %>%  ggplot(aes(peak,slope,col=fear))+
+  geom_point()+
+  facet_wrap(~condition)
+
+
+# comparing the difference in slopes cs- and cs + 
+
+slopes %>% group_by(condition,peak, fear) %>% 
+  summarise( slope = mean(slope)
+  ) %>% pivot_wider(names_from = fear, values_from = slope) %>% mutate(diff = `cs+` - `cs-`) %>% ggplot(aes(peak,diff,col=condition))+
+  geom_point()
+
+
+
+########### slopes per trial
+
+
+
+slopes <- res2 %>% filter(cluster_id %in% bombg$cluster_id)  %>% 
+  mutate(rel_time = round(rel_time, 2)) %>% 
+  mutate(peak = case_when(
+    rel_time == 0.05 ~ 1,
+    rel_time == 1.05 ~ 2,
+    rel_time == 2.05 ~ 3,
+    rel_time == 3.05 ~ 4,
+    rel_time == 4.05 ~ 5,
+    TRUE ~ NA_real_
+  )) %>% 
+  na.omit() %>% 
+  left_join(shock) %>% 
+  mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"), 'cs+', "cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  
+  group_by(condition,Animal,trial_rank, peak, fear) %>% 
+  summarise(mz = mean(rate), .groups = "drop") %>% 
+
+  # 🔑 fit LM per facet
+  group_by(condition,Animal,trial_rank, fear) %>% 
+  summarise(
+    slope = coef(lm(mz ~ peak))[2],
+    .groups = "drop"
+  )
+
+slopes %>% group_by(condition,trial_rank, fear) %>% 
+  summarise( slope = mean(slope)
+  ) %>%  ggplot(aes(trial_rank,slope,col=fear))+
+  geom_point()+
+  facet_wrap(~condition)+
+  geom_smooth(method='lm',se=F)
+
+
+res2%>% 
+  mutate(rel_time = round(rel_time, 2)) %>% 
+  mutate(peak = case_when(
+    rel_time == 0.05 ~ 1,
+    rel_time == 1.05 ~ 2,
+    rel_time == 2.05 ~ 3,
+    rel_time == 3.05 ~ 4,
+    rel_time == 4.05 ~ 5,
+    TRUE ~ NA_real_
+  )) %>% 
+  na.omit() %>% 
+  left_join(shock) %>% 
+  mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"), 'cs+', "cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  
+  group_by(condition,Animal,trial_rank, peak, fear) %>% 
+  summarise(mz = mean(rate), .groups = "drop") %>% group_by(peak,fear,condition) %>% summarise(mz = mean(mz)) %>% group_by(fear,condition) %>% mutate(mz = mz - mean(mz)) %>% ggplot(aes(peak,mz,col=fear))+
+  geom_line()
+  facet_wrap(~Animal)
+  
+  
+  res3 <- res2
+  
+lines <- res3 %>%  filter(cluster_id %in% bombg$cluster_id) %>% left_join(shock) %>% 
+  mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"), 'cs+', "cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  
+  group_by(trial_rank, fear,condition) %>% 
+  summarise(mz = mean(z_rate), .groups = "drop") 
+
+
+res3 %>%  filter(cluster_id %in% bombg$cluster_id)  %>%  left_join(shock) %>% 
+  mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"), 'cs+', "cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  
+  group_by(trial_rank, fear,condition,rel_time) %>% 
+  summarise(mz = mean(z_rate), .groups = "drop") %>% ggplot(aes(rel_time,mz, col = trial_rank,group= trial_rank))+
+  geom_line()+
+  facet_grid(condition ~ fear)+
+  geom_hline(data = lines, aes(yintercept = mz, col = trial_rank))+
+  theme_classic()
+
+
+res3 %>%  filter(cluster_id %in% bombg$cluster_id) %>%  left_join(shock) %>% 
+  mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"), 'cs+', "cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  
+  group_by(trial_rank, fear,condition) %>% 
+  summarise(mz = mean(z_rate), .groups = "drop") %>% ggplot(aes(trial_rank,mz))+
+    facet_grid(condition ~ fear)+
+   geom_point()+
+   geom_smooth(method =  'lm')
+
+
+
+ slope_mean =  res3 %>%  left_join(shock) %>% 
+  mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"), 'cs+', "cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  
+  group_by(trial_rank, fear,condition) %>% 
+  summarise(mz = mean(z_rate), .groups = "drop")
+ 
+ 
+ 
+ slope_mean %>% group_by(condition,fear) %>% arrange(trial_rank) %>% mutate(change = mz - lag(mz)) %>% ggplot(aes(trial_rank,change))+
+   geom_point()+
+   facet_grid(condition ~ fear)+
+   geom_smooth(span=0.2)
+ 
+ 
+
+ 
+
+slopes <-  res3 %>%  left_join(shock) %>% 
+  mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"), 'cs+', "cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  
+  group_by(Animal,trial_rank, fear,condition) %>% 
+  summarise(mz = mean(z_rate), .groups = "drop") %>% 
+
+  # 🔑 fit LM per facet
+  group_by(Animal,condition, fear) %>% 
+  summarise(
+    slope = coef(lm(mz ~ trial_rank))[2],
+    .groups = "drop"
+  )
+
+slopes %>%ggplot(aes(Animal, slope,col=fear))+
+  facet_grid(~condition)+
+  geom_point()
+
+slopes <- slopes %>% filter(condition != "naive" | Animal != "8186") %>% filter(condition == 'recall')
+
+mod <- lm(data = slopes, slope ~ fear )
+
+plot(mod)
+
+summary(mod)
+pairs(emmeans::emmeans(mod, ~ fear ))
+
+
+
+
+
+library(tidyverse)
+
+# 1. Prepare the data processing pipeline as a function or a single flow
+# 2. Split by Animal to create a list of dataframes
+# 3. Map the plotting function over that list
+
+plots <- res3 %>%
+  left_join(shock) %>%
+  mutate(
+    fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"), 'cs+', "cs-"),
+    trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))
+  ) %>%
+  group_by(Animal, fear, condition) %>%
+  mutate(trial_rank = dense_rank(trial_sequence)) %>%
+  filter(trial_rank <= 12) %>%
+  # Group by Animal here so we get individual means per animal
+  group_by(Animal, trial_rank, fear, condition) %>%
+  summarise(mz = mean(z_rate), .groups = "drop") %>%
+  
+  # Split into a list of dataframes by Animal
+  group_split(Animal) %>%
+  
+  # Loop through each animal's data and create the plot
+  map(~{
+    animal_id <- unique(.x$Animal)
+    
+    ggplot(.x, aes(x = trial_rank, y = mz)) +
+      facet_grid(condition ~ fear) +
+      geom_point() +
+      geom_smooth(method = 'lm', formula = y ~ x) +
+      labs(title = paste("Animal ID:", animal_id),
+           y = "Mean Z-Rate",
+           x = "Trial Rank") +
+      theme_minimal()
+  })
+
+# To view the first plot:
+plots[[1]]
+plots[[2]]
+plots[[3]]
+plots[[4]]
+plots[[5]]
+plots[[6]]
+plots[[7]]
+
+
+read_csv_folder <- function(folder_path) {
+  # 1. List all CSV files in the directory
+  files <- list.files(
+    path = folder_path, 
+    pattern = "\\.csv$", 
+    full.names = TRUE
+  )
+  
+  # Check if folder is empty to avoid errors
+  if (length(files) == 0) {
+    stop("No CSV files found in the specified directory.")
+  }
+
+  # 2. Read all files into one dataframe
+  # The 'id' argument creates a column with the full file path
+  df <- read_csv(files, id = "file_origin") %>%
+    mutate(
+      # 3. Clean the 'file_origin' column
+      # basename() removes the path, file_path_sans_ext() removes .csv
+      file_origin = tools::file_path_sans_ext(basename(file_origin))
+    )
+  
+  return(df)
+}
+
+Zeta_audio <- read_csv_folder("I:/Data/aligned/new/binfree/extra/Zeta_Audio") %>% unite('cluster_id',unit,file_origin) %>% filter(p_val < 0.05)
+
+
+
+ 
+ 
+ res3%>% filter(cluster_id %in% Zeta_audio$cluster_id) %>% filter(cluster_id %in% bombg$cluster_id) %>%   left_join(shock) %>% 
+  mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"), 'cs+', "cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  
+  group_by(trial_rank, fear,condition) %>% 
+  summarise(mz = mean(z_rate), .groups = "drop") %>% ggplot(aes(trial_rank,mz))+
+    facet_grid(condition ~ fear)+
+   geom_point()+
+   geom_smooth(method =  'lm')
+ 
+ 
+ 
+ 
+ 
+  slope_mean =  res3 %>% filter(cortex == 'cortex')  %>% filter(cluster_id %in% Zeta_audio$cluster_id) %>%  left_join(shock) %>% 
+  mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"), 'cs+', "cs-")) %>% 
+  mutate(trial_sequence = as.numeric(stringr::str_remove(trial_number, "_.*"))) %>% 
+  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial_sequence)) %>% 
+  filter(trial_rank <= 12) %>%  
+  group_by(Animal,trial_rank, fear,condition) %>% 
+  summarise(mz = mean(z_rate), .groups = "drop")
+ 
+ 
+ 
+ slope_mean %>% group_by(Animal,condition,fear) %>% arrange(trial_rank) %>% mutate(change = mz - lag(mz)) %>% ungroup() %>% mutate(trial_rank_cat = ifelse(trial_rank >5, 'late','early')) %>% na.omit() %>% summarise(change = mean(change), .by=c(trial_rank,trial_rank_cat,Animal,condition,fear)) %>%  ggplot(aes(trial_rank_cat,change))+
+   geom_boxplot()+
+   facet_grid(condition ~ fear)
+ 
+ slope_mean %>% group_by(Animal,condition,fear) %>% arrange(trial_rank) %>% mutate(change = mz - lag(mz)) %>% ungroup() %>% mutate(trial_rank_cat = ifelse(trial_rank >6, 'late','early')) %>% na.omit()%>% group_by(condition,fear,trial_rank_cat) %>% summarise(change = mean(change)) %>% ggplot(aes(trial_rank_cat,change))+
+   geom_point()+
+    facet_grid(condition ~ fear)
+ 
+  
+
+ 
+ 
+```
+
+# trial averaged plots- Opto
+
+```{r}
+
+df_all <- as.data.table(binfree)
+# Define your bin width once to ensure consistency
+base_bin_width <- 1 
+breaks <- seq(-35, -5, by = base_bin_width)
+centers <- breaks[-length(breaks)] + (base_bin_width / 2)
+
+# 1. Pre-calculate bin_idx on the full data table to avoid .SD locking
+df_all[, bin_idx := findInterval(rel_time, breaks)]
+
+baseline_stats_list <- df_all[rel_time >= -35 & rel_time < -5, {
+  
+  # 2. Create the "Every Neuron x Every Trial x Every Bin" grid
+  # This is the secret sauce for a Z-score that averages to 0
+  full_grid <- CJ(
+    cluster_id   = unique(cluster_id),
+    trial_number = unique(trial_number),
+    bin_idx      = seq_along(centers)
+  )
+  
+  # 3. Count spikes per bin (on the already-filtered .SD)
+  counts <- .SD[, .(.N), by = .(cluster_id, trial_number, bin_idx)]
+  
+  # 4. Join and fill zeros
+  res <- counts[full_grid, on = .(cluster_id, trial_number, bin_idx)]
+  res[is.na(N), N := 0]
+  res[, rate := N / base_bin_width]
+  
+  # 5. Calculate stats across the pooled distribution
+  res[, .(
+    base_mean = mean(rate),
+    base_sd   = sd(rate)
+  ), by = cluster_id]
+
+}, by = .(Animal, condition)]
+
+# Clean up
+df_all[, bin_idx := NULL]
+baseline_stats_list <- baseline_stats_list %>% mutate(Animal = as.character(Animal))
+
+
+
+res3 <- binfree  %>% 
+  bin_events_dt_final(
+    bin_width = 0.1,
+    bin_range = c(-1,7), # Averages trials, keeps clusters
+    baseline_df = baseline_stats_list,
+    average_by = c('cluster_id',"trial_type"))
+
+depths <- list.files("I:/Data/aligned/new/extra/extrenum_channels", "*.csv", full.names = TRUE) %>%
+  set_names(basename(.) %>% str_remove(".csv")) %>%
+  map_dfr(read_csv, .id = "source_file") %>% group_by(source_file) %>%  mutate(dist_from_max = max(dist_from_tip_um) - dist_from_tip_um) %>% mutate(cortex = ifelse(dist_from_max < 1000,'cortex','no')) %>% unite("cluster_id", unit_id, source_file) %>% select(cluster_id, dist_from_max,cortex)
+
+id_lookup <- res3 %>%
+  distinct(cluster_id) %>%
+  separate(cluster_id, into = c("trash", "Animal", "condition"), sep = "_", extra = "merge",remove = F) %>% select(!trash)
+
+res3 <- res3 %>% left_join(id_lookup) %>% left_join(shock) %>% mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"),'cs+',"cs-")) %>% mutate(Opto = ifelse(str_starts(trial_type, 'Opto'), 'opto', 'no')) 
+
+
+
+
+
+
+#### difference between mena of rate and mean of Z-score
+
+
+
+res3 %>% filter(cluster_id %in% bombg$cluster_id) %>%  group_by(rel_time) %>% summarise(z_rate = mean(z_rate), rate = mean(rate))  %>%  pivot_longer(cols=c(rate,z_rate), names_to = "rt", values_to = 'val') %>% 
+ggplot(aes(rel_time,val,col=rt))+
+  facet_wrap(~rt,scales='free')+
+  geom_vline(data=tibble('line'= seq(0,4,1)),aes(xintercept = line),alpha=0.1)+
+  theme_classic()+
+  geom_line()
+
+
+
+
+### Opto,all units
+
+
+
+res3  %>%  unite("ID",Animal,condition) %>% left_join(depths) %>%  group_by(rel_time,Opto) %>% summarise(rate = mean(z_rate)) %>% ggplot(aes(rel_time,rate,col=Opto))+
+  geom_line()
+
+### Opto Region
+
+res3 %>%  unite("ID",Animal,condition) %>% left_join(depths) %>%  group_by(cortex,rel_time,Opto) %>% summarise(rate = mean(z_rate)) %>% na.omit() %>%  ggplot(aes(rel_time,rate,col=Opto))+
+  geom_line()+
+  facet_wrap(~cortex)
+
+### Opto bomb
+
+res3   %>%  unite("ID",Animal,condition)  %>% left_join(bomb) %>%  group_by(label,rel_time,Opto)  %>% summarise(rate = mean(z_rate)) %>%  na.omit() %>% ggplot(aes(rel_time,rate,col=Opto))+
+  geom_line()+
+  facet_wrap(~label)
+
+
+
+### Opto best case, bombg and cortex
+
+
+res3 %>% filter(cluster_id %in% bombg$cluster_id)  %>%  unite("ID",Animal,condition) %>% left_join(depths) %>% filter(cortex == 'cortex') %>%  group_by(rel_time,Opto) %>% summarise(rate = mean(z_rate)) %>% ggplot(aes(rel_time,rate,col=Opto))+
+  geom_line()
+
+
+
+#### best case by Animal
+
+res3 %>% filter(cluster_id %in% bombg$cluster_id)  %>%  unite("ID",Animal,condition) %>% left_join(depths) %>% filter(cortex == 'cortex') %>%  group_by(ID,rel_time,Opto) %>% summarise(rate = mean(z_rate)) %>% ggplot(aes(rel_time,rate,col=Opto))+
+  geom_line()+
+  facet_wrap(~ID,scales='free')
+
+
+
+
+
+
+
+
+
+res3 %>% filter(cluster_id %in% bombg$cluster_id) %>%  unite("ID",Animal,condition) %>% left_join(depths) %>%  group_by(cortex,rel_time,Opto) %>% summarise(rate = mean(rate)) %>% ggplot(aes(rel_time,rate,col=Opto))+
+  geom_line()+
+  facet_wrap(~cortex,scales ='free')+
+  geom_smooth(span=0.1,se=F)
+
+
+
+res3  %>%  unite("ID",Animal,condition) %>% left_join(depths) %>%  group_by(cortex,rel_time,Opto) %>% summarise(rate = mean(z_rate)) %>% ggplot(aes(rel_time,rate,col=Opto))+
+  geom_line()+
+  facet_wrap(~cortex,scales ='free')+
+  geom_smooth(span=0.1,se=F)
+
+res3 %>% filter(cluster_id %in% bombg$cluster_id)  %>%  unite("ID",Animal,condition) %>% left_join(depths) %>% filter(cortex == 'cortex') %>%  group_by(ID,rel_time,Opto) %>% summarise(rate = mean(rate)) %>% ggplot(aes(rel_time,rate,col=Opto))+
+  geom_line(alpha=0.2)+
+  facet_wrap(~ID,scales ='free')+
+  geom_smooth(span=0.1,se=F)+
+  geom_vline(data=tibble('line'= seq(0,4,1)),aes(xintercept = line),alpha=0.1)+
+  theme_classic()
+
+res3 %>% filter(cluster_id %in% bombg$cluster_id)  %>%  unite("ID",Animal,condition) %>% left_join(depths) %>% filter(cortex == 'cortex') %>%  group_by(ID,rel_time,Opto) %>% summarise(rate = mean(z_rate)) %>% ggplot(aes(rel_time,rate,col=Opto))+
+  geom_line(alpha=0.2)+
+  facet_wrap(~ID,scales ='free')+
+  geom_smooth(span=0.1,se=F)+
+  geom_vline(data=tibble('line'= seq(0,4,1)),aes(xintercept = line),alpha=0.1)+
+  theme_classic()
+
+res3   %>%  unite("ID",Animal,condition) %>% left_join(depths) %>% filter(cortex == 'cortex') %>% left_join(bomb) %>%  group_by(label,rel_time,Opto) %>% summarise(rate = mean(z_rate)) %>% ggplot(aes(rel_time,rate,col=Opto))+
+  geom_line(alpha=0.2)+
+  facet_wrap(~label,scales ='free')+
+  geom_smooth(span=0.1,se=F)+
+  geom_vline(data=tibble('line'= seq(0,4,1)),aes(xintercept = line),alpha=0.1)+
+  theme_classic()
+
+bomb
+
+res3 %>% distinct(rel_time)
+
+
+
+
+res3  %>%  unite("ID",Animal,condition) %>% left_join(depths)  %>%  group_by(ID,rel_time,Opto) %>% summarise(rate = mean(rate)) %>% ggplot(aes(rel_time,rate,col=Opto))+
+  geom_line()+
+  facet_wrap(~ID,scales ='free')+
+  theme_classic()
+```
+
+# Downsweep vs Upsweep
+
+```{r}
+
+
+res3  %>% filter(Opto == 'no') %>% mutate(trial_type = stringr::str_remove(trial_type, "^Opto_")) %>%   unite("ID",Animal,condition,remove = F) %>% left_join(depths)  %>%  group_by(rel_time,trial_type,condition) %>% summarise(rate=mean(z_rate)) %>% ggplot(aes(rel_time,rate,col=condition))+
+  geom_line()+
+  facet_wrap(~trial_type)
+
+res3 %>% filter(Opto == 'no') %>% filter(condition=='naive') %>% filter(cluster_id %in% bombg$cluster_id)  %>%  unite("ID",Animal,condition,remove = F) %>% left_join(depths) %>% filter(cortex == 'cortex') %>%  group_by(Animal,rel_time,trial_type) %>% summarise(rate=mean(z_rate)) %>% ggplot(aes(rel_time,rate,col=trial_type))+
+  geom_line()+
+  geom_smooth(span=0.1,se=F)+
+  facet_wrap(~Animal,scales='free')
+
+
+
+res3  %>% filter(Opto == 'no') %>% mutate(trial_type = stringr::str_remove(trial_type, "^Opto_")) %>%   unite("ID",Animal,condition,remove = F) %>% left_join(depths) %>%  filter(cortex=='cortex')  %>% filter(Opto == 'no')  %>%  group_by(rel_time,trial_type,condition)  %>% summarise(rate=mean(z_rate)) %>% ggplot(aes(rel_time,rate,col=condition))+
+  geom_line()+
+  facet_wrap(~trial_type)
+
+
+res3  %>% filter(Opto == 'no') %>%  filter(rel_time == 0.05) %>% mutate(trial_type = stringr::str_remove(trial_type, "^Opto_")) %>%   unite("ID",Animal,condition,remove = F) %>% left_join(depths) %>%  filter(cortex=='cortex')  %>% filter(Opto == 'no')  %>%  group_by(Animal,rel_time,trial_type,condition)  %>% summarise(rate=mean(z_rate)) %>% pivot_wider(names_from = condition,values_from = rate) %>% mutate(diff =  recall-naive) %>% na.omit() %>% ggplot(aes(trial_type,diff,group= Animal))+
+  geom_point()+
+  geom_line()
+
+
+
+res3 <- binfree  %>% 
+  bin_events_dt_final(
+    bin_width = 0.1,
+    bin_range = c(-0.25,0.25), # Averages trials, keeps clusters
+    baseline_df = baseline_stats_list,
+    average_by = NULL)
+
+depths <- list.files("I:/Data/aligned/new/extra/extrenum_channels", "*.csv", full.names = TRUE) %>%
+  set_names(basename(.) %>% str_remove(".csv")) %>%
+  map_dfr(read_csv, .id = "source_file") %>% group_by(source_file) %>%  mutate(dist_from_max = max(dist_from_tip_um) - dist_from_tip_um) %>% mutate(cortex = ifelse(dist_from_max < 1000,'cortex','no')) %>% unite("cluster_id", unit_id, source_file) %>% select(cluster_id, dist_from_max,cortex)
+
+id_lookup <- res3 %>%
+  distinct(cluster_id) %>%
+  separate(cluster_id, into = c("trash", "Animal", "condition"), sep = "_", extra = "merge",remove = F) %>% select(!trash)
+
+res3 <- res3 %>% left_join(id_lookup) %>% left_join(shock) %>% mutate(fear = ifelse(direction == stringr::str_remove(trial_type, "^Opto_"),'cs+',"cs-")) %>% mutate(Opto = ifelse(str_starts(trial_type, 'Opto'), 'opto', 'no')) 
+
+
+
+stat<- res3  %>% filter(Opto == 'no') %>%  filter(round(rel_time,2) == 0.1) %>% mutate(trial_type = stringr::str_remove(trial_type, "^Opto_")) %>%   unite("ID",Animal,condition,remove = F) %>% left_join(depths) %>%  filter(cortex=='cortex')  %>% filter(Opto == 'no')  %>%  group_by(trial_number,Animal,rel_time,trial_type,condition)  %>% summarise(rate=mean(z_rate)) %>% ungroup()  %>% pivot_wider(names_from = condition,values_from = rate) %>% mutate(diff =  recall-naive) %>% na.omit()
+
+mod<- lm(data=stat, rate ~ condition*trial_type)
+
+summary(mod)
+
+pairs(emmeans::emmeans(mod,~condition|trial_type))
+
+```
+
+```{r}
+res2 <- binfree %>% 
+  mutate(Opto = ifelse(str_starts(trial_type, 'Opto'), 'opto', 'no')) %>%  
+  bin_events_dt_final(
+    bin_width = 0.05,
+    bin_range = c(-3,5), # Averages trials, keeps clusters
+    baseline_df = baseline_stats_list,
+    average_by = c('cluster_id',"trial_type"))
+
+
+
+res2  %>% filter(between(rel_time,-0.1,1)) %>% 
+  mutate(Opto = ifelse(str_starts(trial_type, 'Opto'), 'opto', 'no')) %>%  group_by(rel_time,trial_type) %>% na.omit() %>%  summarise(mz = mean(z_rate)) %>% ggplot(aes(rel_time,mz,col=trial_type))+
+  geom_line()
+
+depths <- list.files("I:/Data/aligned/ArchT/extra/extremum", "*.csv", full.names = TRUE) %>%
+  set_names(basename(.) %>% str_remove(".csv")) %>%
+  map_dfr(read_csv, .id = "source_file") %>% group_by(source_file) %>%  mutate(dist_from_max = max(dist_from_tip_um) - dist_from_tip_um) %>% mutate(cortex = ifelse(dist_from_max < 1000,'cortex','no')) %>% unite("cluster_id", unit_id, source_file) %>% select(cluster_id, dist_from_max,cortex)
+
+
+res2 %>% left_join(depths) %>% filter(cortex=='cortex') %>% filter(between(rel_time,-0.5,1)) %>% 
+  mutate(Opto = ifelse(str_starts(trial_type, 'Opto'), 'opto', 'no')) %>%  group_by(rel_time,trial_type) %>% na.omit() %>%  summarise(mz = mean(rate)) %>% ggplot(aes(rel_time,mz,col=trial_type))+
+  geom_smooth(span=0.2,se=F)
+
+
+
+
+
+res2 %>% left_join(depths)  %>% filter(between(rel_time,0.1,1)) %>% filter(trial_type=='Laser_only') %>%  group_by(dist_from_max) %>% na.omit() %>%  summarise(mz = mean(rate)) %>% ggplot(aes(dist_from_max,mz))+
+  geom_point()+
+  xlim(-10,10)
+
+
+res2 %>% left_join(depths) %>% filter(cortex=='cortex') %>% filter(between(rel_time,-1,1)) %>% filter(trial_type=='Laser_only') %>% mutate(timecat = ifelse(rel_time<0 ,"pre","post")) %>% group_by(cluster_id,timecat) %>% summarise(mz = mean(rate)) %>% pivot_wider(names_from = timecat,values_from = mz) %>% mutate(diff = post-pre) %>% ggplot(aes(diff))+
+  geom_histogram()+  xlim(-5,5)
+
+
+res2 %>% left_join(depths)  %>% filter(cortex=='cortex')  %>% filter(between(rel_time,-3,-1)) %>% filter(trial_type=='Laser_only') %>% mutate(timecat = ifelse(rel_time < -2 ,"pre","post")) %>% group_by(cluster_id,timecat) %>% summarise(mz = mean(rate)) %>% pivot_wider(names_from = timecat,values_from = mz) %>% mutate(diff = post-pre) %>% ggplot(aes(diff))+
+  geom_histogram()+  xlim(-5,5)
+
+
+
+d1 <- res2 %>%
+  left_join(depths) %>%
+  filter(
+    cortex == "cortex",
+    between(rel_time, -0.5, 1.5),
+    trial_type == "Laser_only"
+  ) %>%
+  mutate(timecat = if_else(rel_time < 0, "pre", "post")) %>%
+  group_by(cluster_id, timecat) %>%
+  summarise(mz = mean(z_rate, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = timecat, values_from = mz) %>%
+  mutate(
+    diff = post - pre,
+    window = "-1 to 1"
+  )
+
+d2 <- res2 %>%
+  left_join(depths) %>%
+  filter(
+    cortex == "cortex",
+    between(rel_time, -3, -1),
+    trial_type == "Laser_only"
+  ) %>%
+  mutate(timecat = if_else(rel_time < -2, "pre", "post")) %>%
+  group_by(cluster_id, timecat) %>%
+  summarise(mz = mean(z_rate, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = timecat, values_from = mz) %>%
+  mutate(
+    diff = post - pre,
+    window = "-3 to -1"
+  )
+
+bind_rows(d1, d2) %>%
+  filter(!is.na(diff)) %>%
+  ggplot(aes(x = diff, fill = window)) +
+  geom_histogram(
+    bins = 30,
+    alpha = 0.5,
+    position = "identity"
+  ) +
+  labs(
+    x = "Post - pre firing rate",
+    fill = "Time window"
+  ) +
+  theme_classic()
+
+
+
+
+
+res2 %>%
+  separate_wider_delim(
+    cluster_id,
+    delim = "_",
+    names = c("unit_id", "session"),
+    too_many = "merge",cols_remove = F
+  )  %>% filter(between(rel_time,-0.5,1)) %>% 
+  mutate(Opto = ifelse(str_starts(trial_type, 'Opto'), 'opto', 'no')) %>%  group_by(session,rel_time,trial_type) %>% na.omit() %>%  summarise(mz = mean(z_rate)) %>% ggplot(aes(rel_time,mz,col=trial_type))+
+  geom_smooth(span=0.2,se=F)+
+  facet_wrap(~session)+
+  theme_classic()
+
+
+?separate_wider_delim
+
+
+res2 %>% left_join(depths) %>%
+  separate_wider_delim(
+    cluster_id,
+    delim = "_",
+    names = c("unit_id", "session"),
+    too_many = "merge",cols_remove = F
+  )  %>% filter(session == '8104_naive')  %>% filter(between(rel_time,-2,8)) %>% filter(cortex=='cortex') %>% filter(trial_type=='Laser_only') %>%  group_by(rel_time) %>% na.omit() %>%  summarise(mz = mean(rate)) %>% ggplot(aes(rel_time,mz))+
+  geom_line()+
+  theme_classic()
+```
+
+```{r}
+
+
+res2 <- binfree %>% 
+  bin_events_dt_final(
+    bin_width = 0.05,
+    bin_range = c(-3,5), # Averages trials, keeps clusters
+    baseline_df = baseline_stats_list,
+    average_by = c('cluster_id',"trial_type"))
+
+
+
+res2  %>% filter(between(rel_time,-0.1,1)) %>% 
+  mutate(Opto = ifelse(str_starts(trial_type, 'Opto'), 'opto', 'no')) %>%  group_by(rel_time,trial_type) %>% na.omit() %>%  summarise(mz = mean(z_rate)) %>% ggplot(aes(rel_time,mz,col=trial_type))+
+  geom_line()
+
+
+
+
+res2 %>% 
+
+```
+
+```{r}
+
+
+res2 <- binfree %>% filter(trial_type %in% c("Downsweep","Upsweep")) %>% 
+  bin_events_dt_final(
+    bin_width = 0.1,
+    bin_range = c(-2,8), # Averages trials, keeps clusters
+    baseline_df = baseline_stats_list,
+    average_by = NULL)
+
+res <- res2 %>% left_join(binfree %>% select(Animal,condition,trial_type,fear) %>% distinct()) %>% semi_join(units %>% filter(cortex == 'cortex'))
+
+
+res %>% summarise(mz = mean(z_rate), .by = c(trial_type,rel_time,condition)) %>% ggplot(aes(rel_time,mz,col=trial_type))+
+  geom_line()+
+  facet_wrap(~condition)
+
+res %>% summarise(mz = mean(z_rate), .by = c(fear,rel_time,condition)) %>% ggplot(aes(rel_time,mz,col=fear))+
+  geom_smooth(span=0.1,se=F)+
+  facet_wrap(~condition)
+
+df %>%
+  mutate(column = word(column, 1, sep = fixed("_")))
+
+
+res %>% filter(condition=="recall") %>% 
+  mutate(trial = as.numeric(word(trial_number, 1, sep = fixed("_"))))  %>% 
+  group_by(Animal, fear,condition) %>% 
+  mutate(trial_rank = dense_rank(trial)) %>% ungroup() %>% 
+  summarise(mz = mean(z_rate), .by = c(fear,rel_time,condition,trial_rank)) %>% ggplot(aes(rel_time,mz,col=fear))+
+  geom_smooth(span=0.2,se=F)+
+  facet_wrap(~trial_rank)
+
+
+res %>% filter(condition=="recall") %>% 
+  summarise(mz = mean(z_rate), .by = c(fear,rel_time,condition)) %>% ggplot(aes(rel_time,mz,col=fear))+
+ geom_line()
+res %>% filter(condition=="recall") %>% 
+  summarise(mz = mean(rate), .by = c(fear,rel_time,condition)) %>% ggplot(aes(rel_time,mz,col=fear))+
+  geom_line()
+
+
+
+res%>% filter(condition=="recall")  %>% distinct(cluster_id)
+```
+
+
+
+
+
+```{r}
+binfree2 <-  binfree  %>% semi_join(units %>% filter(cortex == 'cortex')) %>% filter(trial_type %in% c("Downsweep","Upsweep"))
+
+res2 <- binfree2 %>% filter(trial_type %in% c("Downsweep","Upsweep")) %>% 
+  bin_events_dt_final(
+    bin_width = 0.01,
+    bin_range = c(-5,10), # Averages trials, keeps clusters
+    baseline_df = baseline_stats_list,
+    average_by = NULL)
+
+
+res <- res2 %>% left_join(binfree2 %>% select(Animal,condition,trial_type,fear) %>% distinct()) 
+
+binfree2 %>% distinct(cluster_id)
+binfree2 %>% distinct(trial_type)
+
+```
+```{r}
+ggplot2::set_theme(theme_classic())
+# naive vs recall
+
+res %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(condition,rel_time)) %>% 
+  ggplot(aes(rel_time,mz))+
+  geom_line()+
+  facet_wrap(~condition)
+  
+
+
+# Up vs Down
+
+res %>% filter(between(rel_time,-0.1,1)) %>% filter(condition =='naive') %>% summarise(mz = mean(z_rate),.by = c(trial_type,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=trial_type))+
+  geom_line()+
+  facet_wrap(~trial_type)
+
+
+#cs type
+
+res %>% filter(between(rel_time,-1,6)) %>% filter(condition =="naive") %>% summarise(mz = mean(z_rate),.by = c(fear,rel_time)) %>% 
+  ggplot(aes(rel_time,mz))+
+  geom_line()+
+  facet_wrap(~fear)
+
+res %>% filter(between(rel_time,-0.1,1)) %>% filter(condition =="naive") %>% summarise(mz = mean(z_rate),.by = c(fear,rel_time,Animal)) %>% 
+  ggplot(aes(rel_time,mz,col=fear))+
+  geom_smooth(span=0.1,se=F)+
+  facet_wrap(~Animal,scales='free')
+
+res %>% filter(between(rel_time,-0.1,1)) %>% filter(condition =="naive") %>% summarise(mz = mean(z_rate),.by = c(trial_type,rel_time,Animal)) %>% 
+  ggplot(aes(rel_time,mz,col=trial_type))+
+  geom_smooth(span=0.1,se=F)+
+  facet_wrap(~Animal,scales='free')
+
+
+#cs / sweep
+
+res %>% filter(condition == "recall") %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(trial_type,fear,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=fear))+
+  geom_line()+
+  facet_grid(fear~trial_type)
+
+
+
+#cs / cond
+
+res %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(condition,fear,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=fear))+
+  geom_line()+
+  facet_wrap(condition~fear)
+
+
+res %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(condition,fear,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=condition))+
+  geom_line()+
+  facet_wrap(~fear)
+
+
+res %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(condition,fear,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=fear))+
+  geom_line()+
+  facet_wrap(~condition)
+
+
+# change in response from naive to recall
+
+res %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(condition,fear,rel_time)) %>% pivot_wider(names_from = condition,values_from = mz) %>%  mutate(change = recall-naive ) %>% 
+  ggplot(aes(rel_time,change,col=fear))+
+  facet_wrap(~fear)+
+  geom_line()
+
+
+res %>% filter(between(rel_time,-1,6)) %>% filter(fear =="cs+") %>% summarise(mz = mean(z_rate),.by = c(condition,trial_type,rel_time)) %>% pivot_wider(names_from = condition,values_from = mz) %>%  mutate(change = recall-naive ) %>% 
+  ggplot(aes(rel_time,change,col=trial_type))+
+  facet_wrap(~trial_type)+
+  geom_line()
+
+
+
+
+
+# non stimulus locked fear response
+
+longlist <- res %>% filter(between(rel_time,0,5)) %>% filter(condition == "recall") %>%  filter(fear == "cs+") %>% mutate(timew = ifelse( rel_time < 0.1,"onset","long")) %>% summarise(mz = mean(z_rate), .by=c(cluster_id,timew)) %>% pivot_wider(names_from = timew, values_from = mz) %>% mutate(diff = round(onset-long,3)) %>% filter(diff < 0)
+
+res %>% filter(between(rel_time,-1,6)) %>% filter(cluster_id %in% longlist$cluster_id) %>% summarise(mz = mean(z_rate),.by = c(rel_time)) %>% 
+  ggplot(aes(rel_time,mz))+
+  geom_line()
+
+
+
+### JAWS OPTO
+binfree %>% filter(between(rel_time,-2,7)) %>% filter(cluster_id == "834_8251_recall") %>%  mutate(trial_number = as.numeric(word(trial_number, 1, sep = fixed("_")))) %>% ggplot(aes(rel_time,trial_number,col= trial_type))+
+  geom_jitter()
+####
+
+
+binfree2 %>% count(cluster_id) %>% arrange(-n)
+
+
+
+### what makes the CS+ stronger in recall ? more units or stronger each unit
+
+res %>% filter(between(rel_time,0,0.05),fear=="cs+") %>% summarise(mz = mean(z_rate),.by = c(cluster_id, condition)) %>% ggplot(aes(mz,col=condition))+
+  geom_density()+
+  coord_cartesian(ylim = c(0,0.08))
+
+
+res %>% filter(between(rel_time,0,1),fear=="cs+") %>% summarise(mz = mean(rate),.by = c(cluster_id, condition)) %>% ggplot(aes(mz,col=condition))+
+  geom_density()
+
+# it seems as if the main effect is on the onset peak
+# if we exclude the top5 % strongest Units, we get back to pre-conditioning activation levels
+
+excluded_units <- res %>% filter(between(rel_time,0,0.05),fear=="cs+",condition=="recall")  %>%
+  group_by(condition, cluster_id) %>%
+  summarise(
+    peak_rate = max(z_rate, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(condition) %>%
+  slice_max(
+    order_by = peak_rate,
+    prop = 0.1,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+
+# Exclude those units before calculating the mean firing rate
+res %>%
+  anti_join(
+    excluded_units,
+    by = c("condition", "cluster_id")
+  ) %>%
+  filter(
+    between(rel_time, -0.05, 0.05),
+    fear == "cs+"
+  ) %>%
+  summarise(
+    mz = mean(z_rate, na.rm = TRUE),
+    .by = c(condition,rel_time)
+  ) %>%
+  ggplot(aes(rel_time, mz, colour = condition)) +
+  geom_line()
+
+
+res %>%
+  filter(
+    between(rel_time, -0.05, 0.05),
+    fear == "cs+"
+  ) %>%
+  summarise(
+    mz = mean(z_rate, na.rm = TRUE),
+    .by = c(condition,rel_time)
+  ) %>%
+  ggplot(aes(rel_time, mz, colour = condition)) +
+  geom_line()
+
+```
+
+```{r}
+tone_onsets <- c(0, 1, 2, 3, 4)
+
+stimlock <-
+  map_dfr(tone_onsets, \(t0)
+    res %>%
+      filter(condition == "recall",
+             fear == "cs+",
+             between(rel_time, t0, t0 + 0.5)) %>%
+      mutate(window = if_else(rel_time < t0 + 0.1,
+                              "onset","tone")) %>%
+      summarise(rate = mean(z_rate),
+                .by = c(cluster_id, window)) %>%
+      pivot_wider(names_from = window,
+                  values_from = rate) %>%
+      mutate(onset_score = onset - tone)
+  ) %>%
+  summarise(stimlock = mean(onset_score),
+            .by = cluster_id)
+
+
+
+
+mod <- stimlock %>% mutate(modin = ifelse( modulation > quantile(modulation,0.85),"y","n"))
+mod %>% count(modin)
+
+res %>% filter(condition=="recall",
+         fear=="cs+") %>% filter(between(rel_time,-1,6)) %>% left_join(mod) %>% summarise(mz = mean(z_rate),.by = c(rel_time,modin )) %>% 
+  ggplot(aes(rel_time,mz,col=modin))+
+  geom_line()
+
+
+
+
+
+
+sustain <-
+  res %>%
+  filter(condition == "recall",
+         fear == "cs+",
+         between(rel_time,0,5)) %>%
+  summarise(sustain = mean(z_rate),
+            .by = cluster_id)
+
+
+left_join(stimlock, sustain, by="cluster_id") %>%
+  ggplot(aes(stimlock, sustain)) +
+  geom_point(alpha=.5) +
+  geom_vline(xintercept=0, lty=2) +
+  geom_hline(yintercept=0, lty=2)
+
+#############
+
+res2 <-
+  res %>%
+  filter(condition=="recall",
+         fear=="cs+",
+         between(rel_time,0,5)) %>%
+  mutate(
+    phase = if_else((rel_time %% 1) < 0.5,
+                    "tone","silence")
+  ) %>%
+  summarise(rate = mean(z_rate),
+            .by = c(cluster_id, phase)) %>%
+  pivot_wider(names_from = phase,
+              values_from = rate) %>%
+  mutate(modulation = tone - silence)
+
+
+mod <- res2 %>% mutate(modin = ifelse( modulation > quantile(modulation,0.75),"y","n"))
+
+
+res %>% filter(condition=="recall",
+         fear=="cs+") %>% filter(between(rel_time,-1,6)) %>% left_join(mod) %>% summarise(mz = mean(z_rate),.by = c(rel_time,modin )) %>% 
+  ggplot(aes(rel_time,mz,col=modin))+
+  geom_line()
+
+mod <- res2 %>% mutate(modin = ifelse( modulation > quantile(modulation,0.15),"y","n"))
+mod %>% count(modin)
+
+res %>% filter(condition=="recall",
+         fear=="cs+") %>% filter(between(rel_time,-1,6)) %>% left_join(mod) %>% summarise(mz = mean(z_rate),.by = c(rel_time,modin )) %>% 
+  ggplot(aes(rel_time,mz,col=modin))+
+  geom_line()
+
+mod <- res2 %>% mutate(modin = ifelse( modulation > quantile(modulation,0.85),"y","n"))
+mod %>% count(modin)
+
+res %>% filter(condition=="recall",
+         fear=="cs+") %>% filter(between(rel_time,-1,6)) %>% left_join(mod) %>% summarise(mz = mean(z_rate),.by = c(rel_time,modin )) %>% 
+  ggplot(aes(rel_time,mz,col=modin))+
+  geom_line()
+
+
+#########
+
+mod <- stimlock %>% mutate(modin = ifelse( stimlock > quantile(stimlock,0.2),"y","n"))
+mod %>% count(modin)
+
+res %>% filter(condition=="recall",
+         fear=="cs+") %>% filter(between(rel_time,-1,6)) %>% left_join(mod) %>% summarise(mz = mean(z_rate),.by = c(rel_time,modin )) %>% 
+  ggplot(aes(rel_time,mz,col=modin))+
+  geom_line()
+
+
+
+
+
+# mean activity during CS
+cs_response <- res %>%
+  filter(condition=="recall",
+         fear=="cs+",
+         between(rel_time,0,5)) %>%
+  summarise(cs_mean = mean(z_rate),
+            .by = cluster_id)
+
+
+# modulation by the 500 ms on/off structure
+modulation <- res %>%
+  filter(condition=="recall",
+         fear=="cs+",
+         between(rel_time,0,5)) %>%
+  mutate(
+    phase = ifelse((rel_time %% 1) < 0.5,
+                   "tone",
+                   "silence")
+  ) %>%
+  summarise(
+    modulation = mean(z_rate[phase=="tone"]) -
+                 mean(z_rate[phase=="silence"]),
+    .by = cluster_id
+  )
+
+
+neurons <- left_join(cs_response, modulation, by="cluster_id")
+
+
+ggplot(neurons, aes(modulation, cs_mean))+
+  geom_point()+
+  geom_vline(xintercept=0,lty=2)+
+  geom_hline(yintercept=0,lty=2)
+
+try1 <- neurons %>%
+  filter(cs_mean > 0,
+         abs(modulation) < 0.2)
+
+
+pulse_mod <- map_dfr(0:4, \(i){
+
+  res %>%
+    filter(condition=="recall",
+           fear=="cs+",
+           between(rel_time,i,i+0.5)) %>%
+    mutate(phase = ifelse(rel_time < i+0.25,
+                          "early",
+                          "late")) %>%
+    summarise(
+      mod = mean(z_rate[phase=="early"]) -
+            mean(z_rate[phase=="late"]),
+      .by=cluster_id
+    ) %>%
+    mutate(pulse=i)
+
+})
+
+try2 <- pulse_mod %>%
+  summarise(modulation=mean(mod),
+            .by=cluster_id)
+
+
+#t2 # might be good
+
+mod <- try2 %>% mutate(modin = ifelse( modulation > quantile(modulation,0.1),"y","n"))
+
+res %>% filter(condition=="recall",
+         fear=="cs+") %>% filter(between(rel_time,-1,6)) %>% left_join(mod) %>% summarise(mz = mean(z_rate),.by = c(rel_time,modin )) %>% 
+  ggplot(aes(rel_time,mz,col=modin))+
+  geom_line()
+
+
+
+# t1
+
+try1 <- neurons %>%
+  filter(cs_mean > 0,
+         modulation < -0.1)
+
+res %>% filter(condition=="recall",
+         fear=="cs+") %>% filter(between(rel_time,-1,6)) %>% mutate(modin = ifelse(cluster_id %in% try1$cluster_id,"n","y")) %>% summarise(mz = mean(z_rate),.by = c(rel_time,modin )) %>% 
+  ggplot(aes(rel_time,mz,col=modin))+
+  geom_line()
+```
+```{r}
+
+binfree3 <-  binfree  %>% semi_join(units %>% filter(cortex == 'cortex')) %>% filter(trial_type %in% c("Laser_only"))
+
+res3 <- binfree3 %>% 
+  bin_events_dt_final(
+    bin_width = 0.01,
+    bin_range = c(-5,10), # Averages trials, keeps clusters
+    baseline_df = baseline_stats_list,
+    average_by = NULL)
+
+
+res <- res2 %>% left_join(binfree2 %>% select(Animal,condition,trial_type,fear) %>% distinct()) 
+
+res3 %>% filter(Animal =="8104", between(rel_time,-2,6.5)) %>% summarise(mz = mean(rate), .by=c(condition,rel_time)) %>% ggplot(aes(rel_time,mz))+
+  geom_line()+
+  geom_smooth(span=0.1)+
+  facet_wrap(~condition)+
+  coord_cartesian(ylim=c(0,20))
+
+
+binfree %>% distinct(trial_type)
+```
+
+
+
+# new analysis, no Opto, just cortex
+```{r}
+binfree2 <-  binfree  %>% semi_join(units %>% filter(cortex == 'cortex')) %>% filter(trial_type %in% c("Downsweep","Upsweep"))
+res2 <- binfree2 %>% filter(trial_type %in% c("Downsweep","Upsweep")) %>% 
+  bin_events_dt_final(
+    bin_width = 0.01,
+    bin_range = c(-5,10), # Averages trials, keeps clusters
+    baseline_df = baseline_stats_list,
+    average_by = NULL)
+
+
+res <- res2 %>% left_join(binfree2 %>% select(Animal,condition,trial_type,fear) %>% distinct()) 
+
+
+binfree2 %>% distinct(Animal,condition) %>% filter(Animal %in% c("8182","8186"))
+res %>% distinct(Animal,condition) %>% filter(Animal %in% c("8182","8186"))
+
+units %>% filter(is.na(source))
+units  %>% distinct(source)
+```
+```{r}
+ggplot2::set_theme(theme_classic())
+# naive vs recall
+
+res %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(condition,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=condition))+
+  geom_line()+
+  facet_wrap(~condition)
+  
+
+
+# Up vs Down
+
+res %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(trial_type,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=trial_type))+
+  geom_line()+
+  geom_smooth(span=0.05,se=F)+
+  facet_wrap(~trial_type)
+
+#cs type
+
+res %>% filter(between(rel_time,-1,6)) %>% filter(condition=="recall") %>% summarise(mz = mean(z_rate),.by = c(fear,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=fear))+
+  geom_line()
+
+res %>% filter(between(rel_time,-0.1,1)) %>% filter(condition=="recall") %>% summarise(mz = mean(z_rate),.by = c(fear,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=fear))+
+  geom_line()
+
+
+#cs / sweep
+
+res %>% filter(between(rel_time,-1,6)) %>% filter(condition=="recall") %>% summarise(mz = mean(z_rate),.by = c(trial_type,fear,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=fear))+
+  geom_line()+
+  facet_grid(fear~trial_type)
+
+
+
+
+#cs / cond
+
+res %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(condition,fear,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=fear))+
+  geom_line()+
+  facet_wrap(condition~fear)
+
+
+res %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(condition,fear,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=condition))+
+  geom_line()+
+  facet_wrap(~fear)
+
+
+res %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(condition,fear,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=fear))+
+  geom_line()+
+  facet_wrap(~condition)
+
+
+# change in response from naive to recall
+
+res %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(condition,fear,rel_time)) %>% pivot_wider(names_from = condition,values_from = mz) %>%  mutate(change = recall-naive ) %>% 
+  ggplot(aes(rel_time,change))+
+  geom_line()+
+  facet_wrap(~fear)
+
+
+res %>% filter(between(rel_time,-1,6)) %>% filter(fear =="cs-") %>% summarise(mz = mean(z_rate),.by = c(condition,trial_type,rel_time)) %>% pivot_wider(names_from = condition,values_from = mz) %>%  mutate(change = recall-naive ) %>% 
+  ggplot(aes(rel_time,change))+
+  geom_line()+
+  facet_wrap(~trial_type)
+
+###
+
+
+
+res %>% filter(between(rel_time,-1,6)) %>% mutate(rel_time = floor(rel_time/0.020)*0.020) %>% summarise(mz = mean(z_rate),.by = c(trial_type,,rel_time,condition)) %>% 
+  ggplot(aes(rel_time,mz,col=trial_type))+
+  geom_line()+
+  facet_grid(trial_type~condition)
+  
+
+res %>% filter(between(rel_time,-1,6), fear =="cs+")  %>% summarise(mz = mean(z_rate),.by = c(trial_type,Animal,rel_time,condition)) %>% pivot_wider(names_from = condition,values_from = mz) %>% mutate(change = recall-naive) %>% 
+  ggplot(aes(rel_time,change,col=trial_type))+
+  geom_line()+
+  facet_wrap(~Animal,scales='free')
+
+
+res %>% filter(between(rel_time,-1,6), fear =="cs+")  %>% summarise(mz = mean(z_rate),.by = c(trial_type,Animal,rel_time,condition)) %>% pivot_wider(names_from = condition,values_from = mz) %>% mutate(change = recall-naive) %>% filter(Animal == "8182")
+
+binfree %>% distinct(Animal,condition) %>% filter(Animal %in% c("8182","8186"))
+
+baseline_stats_list %>% distinct(Animal,condition) %>% filter(Animal %in% c("8182","8186"))
+```
+
+
+
+
+```{r}
+binfree2 <-  binfree  %>% semi_join(units %>% filter(cortex == 'cortex')) %>% filter(trial_type %in% c("Downsweep","Upsweep"))
+res3 <- binfree2 %>% filter(trial_type %in% c("Downsweep","Upsweep")) %>% 
+  bin_events_dt_final(
+    bin_width = 0.001,
+    bin_range = c(-0.5,5), # Averages trials, keeps clusters
+    baseline_df = baseline_stats_list,
+    average_by = NULL)
+
+
+res4 <- res3 %>% left_join(binfree2 %>% select(Animal,condition,trial_type,fear) %>% distinct()) 
+
+
+A <-res4 %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(condition,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=condition))+
+  geom_line()+
+  facet_wrap(~condition)+
+  ggtitle("1ms")
+
+B <- res %>% filter(between(rel_time,-1,6)) %>% summarise(mz = mean(z_rate),.by = c(condition,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=condition))+
+  geom_line()+
+  facet_wrap(~condition)+  ggtitle("10 ms")
+
+
+C<- res %>% filter(between(rel_time,-1,6)) %>% mutate(rel_time = floor(rel_time/0.020)*0.020) %>% summarise(mz = mean(z_rate),.by = c(condition,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=condition))+
+  geom_line()+
+  facet_wrap(~condition) +  ggtitle("20 ms")
+
+
+D<- res %>% filter(between(rel_time,-1,6)) %>% mutate(rel_time = floor(rel_time/0.050)*0.050) %>% summarise(mz = mean(z_rate),.by = c(condition,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=condition))+
+  geom_line()+
+  facet_wrap(~condition) +  ggtitle("50 ms")
+
+E <- res %>% filter(between(rel_time,-1,6)) %>% mutate(rel_time = floor(rel_time/0.1)*0.1) %>% summarise(mz = mean(z_rate),.by = c(condition,rel_time)) %>% 
+  ggplot(aes(rel_time,mz,col=condition))+
+  geom_line()+
+  facet_wrap(~condition) +  ggtitle("100 ms")
+
+
+A+B+C+D+E+plot_layout(guides = 'collect')
+```
+
+
+
+```{r}
+
+
+binfree2 <-  binfree  %>% semi_join(units %>% filter(cortex == 'cortex')) 
+res2 <- binfree2  %>% 
+  bin_events_dt_final(
+    bin_width = 0.01,
+    bin_range = c(-5,10), # Averages trials, keeps clusters
+    baseline_df = baseline_stats_list,
+    average_by = NULL)
+
+
+res <- res2 %>% left_join(binfree2 %>% select(Animal,condition,trial_type,fear) %>% distinct()) 
+
+
+res %>% filter(Animal=="8252") %>% filter(condition=="naive") %>% filter(between(rel_time,-0.1,1)) %>% summarise(mz = mean(z_rate), .by=c(rel_time,trial_type)) %>%  ggplot(aes(rel_time,mz,col=trial_type))+
+  geom_line()+
+  geom_vline(xintercept = 0)
+
+
+res %>% filter(Animal=="8252") %>% filter(condition=="naive",trial_number=="11_8252_naive") %>% filter(between(rel_time,-0.1,1)) %>% summarise(mz = mean(z_rate), .by=c(cluster_id,rel_time,trial_type)) %>%  ggplot(aes(rel_time,mz,col=trial_type))+
+  geom_line()+
+  facet_wrap(~cluster_id,scales="free")+
+  geom_vline(xintercept = 0)
+
+res %>% filter(Animal=="8252",trial_type=="Downsweep") %>% filter(condition=="naive") %>% filter(between(rel_time,-0.1,1)) %>% summarise(mz = mean(z_rate), .by=c(cluster_id,rel_time)) %>%  ggplot(aes(rel_time,mz))+
+  geom_line()+
+  geom_smooth(span=0.2)+
+  facet_wrap(~cluster_id,scales="free")+
+  geom_vline(xintercept = 0)
+
+
+binfree %>% filter(Animal=="8252") %>% filter(condition=="naive", Opto=='no') %>% filter(between(rel_time,0,0)) %>% select(trial_number,seconds,trial_type)
+
+
+bpod <- read_csv("I:/Data/raw/8252/8252_naive/BPOD.csv")
+
+bpod %>%filter(state_duration>70) %>%  ggplot(aes(state_duration))+
+  geom_histogram()
+
+bpod %>% mutate(state_duration = round(state_duration,2)) %>%  count(state_name,state_duration)
+
+bpod %>% select(continuous_start,state_name,continuous_time) %>% mutate(delay = round(lead(continuous_start) - continuous_start,2))  %>%  count(state_name,delay)
+
+
+aud <- read_csv("I:/Data/raw/8252/8252_naive/Meta/Audio.csv")
+
+aud %>% mutate(delay = round(lead(timestamps) - timestamps,2))  %>% filter(delay >5) %>% ggplot(aes(delay))+
+  geom_histogram()
+
+
+aud %>% filter(edge_type=="rising") %>% mutate(delay = round(lead(timestamps) - timestamps,2))  %>% filter(delay >5) %>% ggplot(aes(delay))+
+  geom_histogram()
+
+bpod %>% filter(state_name %in% sound_state_names) %>% pull(state_name)
+
+aud %>% filter(edge_type=="rising") %>% mutate(state_name = bpod %>% filter(state_name %in% sound_state_names) %>% pull(state_name)
+)  %>% mutate(delay = round(lead(timestamps) - timestamps,5)) %>% filter(state_name %in% c("Downsweep","Upsweep"))%>% ggplot(aes(delay,fill=state_name))+
+  geom_histogram(bins=1000)
+
+
+bpod
+
+
+aud %>% filter(edge_type=="rising") %>% mutate(state_name = bpod %>% filter(state_name %in% sound_state_names) %>% pull(state_name)
+)  %>% mutate(delay = round(lead(timestamps) - timestamps,2)) %>% filter(state_name %in% c("Downsweep","Upsweep"))
+
+
+
+
+res %>% filter(Animal=="8272") %>% filter(condition=="recall") %>% filter(between(rel_time,-0.1,1)) %>% summarise(mz = mean(z_rate), .by=c(rel_time,trial_type)) %>%  ggplot(aes(rel_time,mz,col=trial_type))+
+  geom_line()+
+  facet_wrap(~trial_type, scales="free")+
+  geom_vline(xintercept = 0)
+
+
+
+```
+
+
+
+
+
+
